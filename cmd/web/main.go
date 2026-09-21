@@ -32,7 +32,10 @@ var templates = template.Must(template.New("dashboard").Funcs(template.FuncMap{
 	},
 }).ParseFS(templatesFS, "templates/*.html"))
 
-var osrmRoadRegexp = regexp.MustCompile(`\b([MA]\d+(?:\([^)]*\))?)\b`)
+// roadRefRegexp matches a whole road reference, not a substring: the road
+// number, an optional "(M)" suffix and an optional "Toll". It must stay
+// anchored so that "A1" and "A1(M)", which are different roads, never collapse.
+var roadRefRegexp = regexp.MustCompile(`^([AMN]\d+)\s?(\(M\))?(\s?TOLL)?$`)
 
 type dashboardFilters struct {
 	Road     string
@@ -220,7 +223,7 @@ func planRoute(ctx context.Context, gc *geo.Geocoder, rt *geo.Router, start, end
 		EndLat:      endLat,
 		EndLon:      endLon,
 		Geometry:    r.Geometry,
-		Roads:       extractRoadNames(r.StepNames),
+		Roads:       extractRoadNames(r.Steps),
 		Distance:    r.Distance,
 		Duration:    r.Duration,
 		DistanceKM:  r.Distance / 1000,
@@ -229,16 +232,20 @@ func planRoute(ctx context.Context, gc *geo.Geocoder, rt *geo.Router, start, end
 }
 
 // extractRoadNames returns the unique motorway and A-road names in route order.
-func extractRoadNames(stepNames []string) []string {
+// Road numbers live in a step's Ref (possibly several, joined by ";"); Name is
+// only consulted as a fallback because it is usually a street name.
+func extractRoadNames(steps []geo.Step) []string {
 	seen := make(map[string]bool)
 	var roads []string
 
-	for _, name := range stepNames {
-		road := normalizeRoadName(name)
-		if road == "" {
-			continue
-		}
-		if !seen[road] {
+	for _, step := range steps {
+		candidates := strings.Split(step.Ref, ";")
+		candidates = append(candidates, step.Name)
+		for _, c := range candidates {
+			road := normalizeRoadName(c)
+			if road == "" || seen[road] {
+				continue
+			}
 			seen[road] = true
 			roads = append(roads, road)
 		}
@@ -247,12 +254,22 @@ func extractRoadNames(stepNames []string) []string {
 	return roads
 }
 
+// normalizeRoadName returns the canonical form of a road reference as stored in
+// service_roads.road ("M1", "A1(M)", "M6 Toll"), or "" if name is not exactly
+// a road reference.
 func normalizeRoadName(name string) string {
-	match := osrmRoadRegexp.FindStringSubmatch(name)
-	if len(match) < 2 {
+	m := roadRefRegexp.FindStringSubmatch(strings.ToUpper(strings.TrimSpace(name)))
+	if m == nil {
 		return ""
 	}
-	return strings.ToUpper(match[1])
+	road := m[1]
+	if m[2] != "" {
+		road += "(M)"
+	}
+	if m[3] != "" {
+		road += " Toll"
+	}
+	return road
 }
 
 const routeMatchDistanceMeters = 5000

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -256,7 +257,7 @@ func TestGeocodeUsesCache(t *testing.T) {
 
 const osrmOK = `{"code":"Ok","routes":[{"distance":1500.5,"duration":90,
  "geometry":{"coordinates":[[-1.0,52.0],[-1.1,52.1],[5]]},
- "legs":[{"steps":[{"name":"M1"},{"name":""},{"name":"A14"}]},{"steps":[{"name":"M6"}]}]}]}`
+ "legs":[{"steps":[{"name":"Great North Way","ref":"A1"},{"name":"","ref":"M1"},{"name":"Side Street"}]},{"steps":[{"name":"","ref":"A1(M);A1"}]}]}]}`
 
 // TestRouterRoute verifies OSRM request construction and response conversion.
 func TestRouterRoute(t *testing.T) {
@@ -284,8 +285,14 @@ func TestRouterRoute(t *testing.T) {
 	if len(r.Geometry) != 2 || r.Geometry[0] != wantPts[0] || r.Geometry[1] != wantPts[1] {
 		t.Errorf("geometry = %+v, want %+v (malformed coordinate skipped, GeoJSON lon,lat flipped)", r.Geometry, wantPts)
 	}
-	if got, want := strings.Join(r.StepNames, ","), "M1,,A14,M6"; got != want {
-		t.Errorf("step names = %q, want %q", got, want)
+	wantSteps := []Step{
+		{Name: "Great North Way", Ref: "A1"},
+		{Name: "", Ref: "M1"},
+		{Name: "Side Street"},
+		{Name: "", Ref: "A1(M);A1"},
+	}
+	if !reflect.DeepEqual(r.Steps, wantSteps) {
+		t.Errorf("steps = %+v, want %+v (ref must be kept: OSRM puts road numbers there)", r.Steps, wantSteps)
 	}
 }
 
