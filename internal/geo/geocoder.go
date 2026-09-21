@@ -197,8 +197,14 @@ func (g *Geocoder) waitTurn(ctx context.Context) error {
 // parseRetryAfter reads the delay-seconds form of Retry-After. Nominatim does
 // not always send it, so a missing or unparseable header falls back to 2s.
 func parseRetryAfter(v string) time.Duration {
-	if secs, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && secs >= 0 {
+	v = strings.TrimSpace(v)
+	if secs, err := strconv.Atoi(v); err == nil && secs >= 0 {
 		return time.Duration(secs) * time.Second
+	}
+	if when, err := http.ParseTime(v); err == nil {
+		if wait := time.Until(when); wait > 0 {
+			return wait
+		}
 	}
 	return 2 * time.Second
 }
