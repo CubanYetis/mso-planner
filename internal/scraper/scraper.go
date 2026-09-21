@@ -12,10 +12,9 @@
 package scraper
 
 import (
-	"encoding/json"
+	"context"
 	"fmt"
 	"log"
-	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -23,6 +22,7 @@ import (
 	"github.com/gocolly/colly/v2"
 	"github.com/gocolly/colly/v2/extensions"
 
+	"github.com/BigRedS/mso-planner/internal/geo"
 	"github.com/BigRedS/mso-planner/internal/models"
 )
 
@@ -30,17 +30,7 @@ const (
 	baseURL      = "https://motorwayservices.uk"
 	roadsListURL = baseURL + "/Services_List"
 	requestDelay = 3 * time.Second // polite: one request every 3 seconds
-	geocodeDelay = 1 * time.Second // rate-limit geocoding requests too
 )
-
-var geocodeClient = &http.Client{
-	Timeout: 12 * time.Second,
-}
-
-type nominatimResult struct {
-	Lat string `json:"lat"`
-	Lon string `json:"lon"`
-}
 
 // OnServiceFunc is called for each fully-scraped ServiceArea.
 type OnServiceFunc func(sa models.ServiceArea) error
@@ -52,7 +42,8 @@ type OnServiceFunc func(sa models.ServiceArea) error
 //  4. Calls onService for each completed record
 //
 // The caller controls persistence via onService — typically writing to Postgres.
-func Run(onService OnServiceFunc) error {
+// Coordinates come from gc, which rate-limits and caches its lookups.
+func Run(cfg geo.Config, gc *geo.Geocoder, onService OnServiceFunc) error {
 	// Collect road URLs first, then listings, then details.
 	// We use three separate collectors so we can handle each phase distinctly.
 
@@ -61,7 +52,7 @@ func Run(onService OnServiceFunc) error {
 
 	// ── Phase 1: road index ──────────────────────────────────────────────────
 
-	roadIndexCollector := newCollector()
+	roadIndexCollector := newCollector(cfg)
 
 	roadIndexCollector.OnHTML("div.mw-category a[href]", func(e *colly.HTMLElement) {
 		href := e.Attr("href")
@@ -83,7 +74,7 @@ func Run(onService OnServiceFunc) error {
 
 	// ── Phase 2: per-road listing pages ──────────────────────────────────────
 
-	roadCollector := newCollector()
+	roadCollector := newCollector(cfg)
 
 	roadCollector.OnHTML("table tr", func(e *colly.HTMLElement) {
 		// Each road page has a table: | Services | Location | Operator | Rating | ...
@@ -130,11 +121,11 @@ func Run(onService OnServiceFunc) error {
 
 	// ── Phase 3: individual services detail pages ─────────────────────────────
 
-	detailCollector := newCollector()
+	detailCollector := newCollector(cfg)
 
 	detailCollector.OnHTML("body", func(e *colly.HTMLElement) {
 		listing := listingFromContext(e.Request.Ctx)
-		sa := buildServiceArea(e, listing)
+		sa := buildServiceArea(e, listing, gc)
 		if err := onService(sa); err != nil {
 			log.Printf("Error persisting %s: %v", sa.Name, err)
 		}
@@ -156,7 +147,7 @@ func Run(onService OnServiceFunc) error {
 
 // ── Collector factory ─────────────────────────────────────────────────────────
 
-func newCollector() *colly.Collector {
+func newCollector(cfg geo.Config) *colly.Collector {
 	c := colly.NewCollector(
 		colly.AllowedDomains("motorwayservices.uk", "www.motorwayservices.uk", "motorwayservices.ie", "www.motorwayservices.ie"),
 		colly.Async(false), // sequential — we're being polite
@@ -164,7 +155,7 @@ func newCollector() *colly.Collector {
 
 	// Identify ourselves honestly
 	extensions.RandomUserAgent(c) // sets a real browser UA — acceptable
-	c.UserAgent = "MSO-Planner/0.1 (personal route planning tool; attribution included; contact: ialoneambest@gmail.com)"
+	c.UserAgent = cfg.UserAgent()
 
 	c.Limit(&colly.LimitRule{
 		DomainGlob:  "*motorwayservices.*",
@@ -184,7 +175,7 @@ func newCollector() *colly.Collector {
 
 // buildServiceArea extracts structured data from a services detail page.
 // MSO pages are MediaWiki-based and have a consistent structure.
-func buildServiceArea(e *colly.HTMLElement, listing models.RoadListing) models.ServiceArea {
+func buildServiceArea(e *colly.HTMLElement, listing models.RoadListing, gc *geo.Geocoder) models.ServiceArea {
 	sa := models.ServiceArea{
 		Slug:          slugFromURL(listing.URL),
 		Name:          listing.Name,
@@ -209,7 +200,7 @@ func buildServiceArea(e *colly.HTMLElement, listing models.RoadListing) models.S
 	sa.Postcode = extractPostcode(sa.Address)
 
 	// Geocode coordinates now so the web UI doesn't need to do this later.
-	maybeGeocodeServiceArea(&sa)
+	maybeGeocodeServiceArea(gc, &sa)
 
 	// Facilities — parse the structured facility section that MSO uses.
 	// MSO pages often render these as styled <span> blocks rather than plain <li>/<p> tags.
@@ -231,7 +222,7 @@ func buildServiceArea(e *colly.HTMLElement, listing models.RoadListing) models.S
 	return sa
 }
 
-func maybeGeocodeServiceArea(sa *models.ServiceArea) {
+func maybeGeocodeServiceArea(gc *geo.Geocoder, sa *models.ServiceArea) {
 	query := sa.Postcode
 	if query == "" {
 		query = sa.Address
@@ -240,57 +231,13 @@ func maybeGeocodeServiceArea(sa *models.ServiceArea) {
 		return
 	}
 
-	lat, lon, err := geocodeNominatim(query)
+	lat, lon, err := gc.Geocode(context.Background(), query)
 	if err != nil {
 		log.Printf("warning: could not geocode %s: %v", sa.Name, err)
 		return
 	}
 	sa.Latitude = lat
 	sa.Longitude = lon
-	time.Sleep(geocodeDelay)
-}
-
-func geocodeNominatim(query string) (float64, float64, error) {
-	req, err := http.NewRequest(http.MethodGet, "https://nominatim.openstreetmap.org/search", nil)
-	if err != nil {
-		return 0, 0, err
-	}
-
-	q := req.URL.Query()
-	q.Set("q", query)
-	q.Set("format", "json")
-	q.Set("limit", "1")
-	q.Set("countrycodes", "gb,ie")
-	req.URL.RawQuery = q.Encode()
-	req.Header.Set("User-Agent", "MSO-Planner/0.1 (scraper; route planner tool; contact: change-this-to-your-email@example.com)")
-
-	res, err := geocodeClient.Do(req)
-	if err != nil {
-		return 0, 0, err
-	}
-	defer res.Body.Close()
-
-	if res.StatusCode != http.StatusOK {
-		return 0, 0, fmt.Errorf("geocoding failed: %s", res.Status)
-	}
-
-	var results []nominatimResult
-	if err := json.NewDecoder(res.Body).Decode(&results); err != nil {
-		return 0, 0, err
-	}
-	if len(results) == 0 {
-		return 0, 0, fmt.Errorf("no geocoding results")
-	}
-
-	lat, err := strconv.ParseFloat(results[0].Lat, 64)
-	if err != nil {
-		return 0, 0, err
-	}
-	lon, err := strconv.ParseFloat(results[0].Lon, 64)
-	if err != nil {
-		return 0, 0, err
-	}
-	return lat, lon, nil
 }
 
 // parseFacilities extracts structured facility data from the text lines on a detail page.

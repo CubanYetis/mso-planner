@@ -16,6 +16,7 @@ mso-planner/
 │   ├── scraper/        # Scraper entrypoint
 │   └── web/            # Route-planner web UI (server-rendered, embedded template)
 ├── internal/
+│   ├── geo/            # Nominatim geocoder (rate-limited, Postgres-cached) and OSRM router
 │   ├── models/         # Shared data types
 │   ├── scraper/        # MSO scraper (colly-based)
 │   └── db/             # Postgres layer (pgx)
@@ -42,12 +43,24 @@ haven't been written yet.
 
 ## Local development
 
-Config is via environment variables: `MSO_DB_DSN` (required), `PORT` (web, default 8080).
+Config is via environment variables:
+
+| Variable | Required | Purpose |
+|---|---|---|
+| `MSO_DB_DSN` | yes | Postgres connection string |
+| `MSO_CONTACT` | yes | Email or URL for the User-Agent sent to MSO, Nominatim and OSRM. Their usage policies require a real contact; kept out of the repo on purpose |
+| `PORT` | no | Web listen port (default 8080) |
+| `NOMINATIM_URL`, `OSRM_URL` | no | Point at a self-hosted or stub server instead of the public ones |
 
 ```bash
 docker compose up -d        # Postgres on localhost:5432
 export MSO_DB_DSN="postgres://mso:msopassword@localhost:5432/mso?sslmode=disable"
+export MSO_CONTACT="you@example.com"
 ```
+
+Geocoding results are cached in the `geocode_cache` table, and lookups are held
+to Nominatim's limit of one request per second. The limit is per process, so
+running the scraper and the web UI at once from one IP can still exceed it.
 
 ### Run the scraper
 
@@ -69,6 +82,17 @@ docker compose --profile app up web
 ```
 
 Open <http://localhost:8080> and enter a start and destination.
+
+### Tests
+
+Most tests need nothing. The database-backed ones skip unless `MSO_TEST_DSN`
+points at a throwaway database (never your real one):
+
+```bash
+docker compose exec postgres createdb -U mso mso_test
+export MSO_TEST_DSN="postgres://mso:msopassword@localhost:5432/mso_test?sslmode=disable"
+go test ./...
+```
 
 Inspect the database with `psql "$MSO_DB_DSN"`. `docker compose down -v` wipes it.
 
