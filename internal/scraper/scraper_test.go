@@ -38,6 +38,7 @@ func TestInferDirection(t *testing.T) {
 		{"A14 westbound at J18", "westbound"},
 		{"A14 eastbound at J18", "eastbound"},
 		{"M25 clockwise at J10", "clockwise"},
+		{"M25 anticlockwise at J10", "anticlockwise"},
 		{"M1 between J21 and J21A", "both"},
 		{"", "both"},
 	}

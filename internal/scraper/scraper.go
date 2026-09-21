@@ -450,10 +450,11 @@ func inferDirection(location string) string {
 		return "eastbound"
 	case strings.Contains(lower, "westbound"):
 		return "westbound"
-	case strings.Contains(lower, "clockwise"):
-		return "clockwise"
+	// anticlockwise must be checked first: it contains "clockwise".
 	case strings.Contains(lower, "anticlockwise"):
 		return "anticlockwise"
+	case strings.Contains(lower, "clockwise"):
+		return "clockwise"
 	default:
 		return "both" // online services or junction services serve both directions
 	}
