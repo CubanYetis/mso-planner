@@ -169,16 +169,29 @@ func (g *Geocoder) fetchOnce(ctx context.Context, query string) (lat, lon float6
 // upstream request, so concurrent callers queue rather than burst. The slot is
 // reserved before sleeping, which keeps the spacing right under contention.
 func (g *Geocoder) waitTurn(ctx context.Context) error {
-	g.mu.Lock()
-	now := time.Now()
-	start := g.last.Add(g.minInterval)
-	if start.Before(now) {
-		start = now
-	}
-	g.last = start
-	g.mu.Unlock()
+	for {
+		g.mu.Lock()
+		now := time.Now()
+		start := g.last.Add(g.minInterval)
+		if start.Before(now) {
+			start = now
+		}
+		g.mu.Unlock()
 
-	return sleep(ctx, time.Until(start))
+		if err := sleep(ctx, time.Until(start)); err != nil {
+			return err
+		}
+
+		g.mu.Lock()
+		now = time.Now()
+		if g.last.Add(g.minInterval).After(now) {
+			g.mu.Unlock()
+			continue
+		}
+		g.last = now
+		g.mu.Unlock()
+		return nil
+	}
 }
 
 // parseRetryAfter reads the delay-seconds form of Retry-After. Nominatim does
