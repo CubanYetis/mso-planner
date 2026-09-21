@@ -20,9 +20,17 @@ type Route struct {
 	Geometry []Point
 	Distance float64 // metres
 	Duration float64 // seconds
-	// StepNames are the road names of each step, in order, unfiltered. Callers
-	// decide which of them are roads they care about.
-	StepNames []string
+	// Steps are the route's steps in order, unfiltered. Callers decide which
+	// of them are roads they care about.
+	Steps []Step
+}
+
+// Step names the road a route step follows. OSRM keeps road numbers in Ref
+// (e.g. "M1", or "A1(M);A1" where several apply) and the street name in Name,
+// which is often empty on motorways.
+type Step struct {
+	Name string
+	Ref  string
 }
 
 // Router asks an OSRM server for driving routes.
@@ -52,6 +60,7 @@ type osrmResponse struct {
 		Legs []struct {
 			Steps []struct {
 				Name string `json:"name"`
+				Ref  string `json:"ref"`
 			} `json:"steps"`
 		} `json:"legs"`
 	} `json:"routes"`
@@ -99,7 +108,7 @@ func (r *Router) Route(ctx context.Context, from, to Point) (Route, error) {
 	}
 	for _, leg := range best.Legs {
 		for _, step := range leg.Steps {
-			out.StepNames = append(out.StepNames, step.Name)
+			out.Steps = append(out.Steps, Step{Name: step.Name, Ref: step.Ref})
 		}
 	}
 	return out, nil
