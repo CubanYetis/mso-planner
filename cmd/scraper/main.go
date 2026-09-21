@@ -2,7 +2,11 @@
 //
 // Usage:
 //
-//	MSO_DB_DSN="postgres://mso:password@localhost:5432/mso?sslmode=disable" ./scraper
+//	MSO_DB_DSN="postgres://mso:password@localhost:5432/mso?sslmode=disable" \
+//	MSO_CONTACT="you@example.com" ./scraper
+//
+// MSO_CONTACT goes in the User-Agent sent to MSO and Nominatim. NOMINATIM_URL
+// overrides the geocoder endpoint.
 //
 // The scraper is intentionally slow (3s delay per request) to be polite to MSO.
 // Expect a full run to take 2–4 hours for the complete site (~500+ service pages).
@@ -20,6 +24,7 @@ import (
 	"time"
 
 	"github.com/BigRedS/mso-planner/internal/db"
+	"github.com/BigRedS/mso-planner/internal/geo"
 	"github.com/BigRedS/mso-planner/internal/models"
 	"github.com/BigRedS/mso-planner/internal/scraper"
 )
@@ -30,6 +35,11 @@ func main() {
 	dsn := os.Getenv("MSO_DB_DSN")
 	if dsn == "" {
 		log.Fatal("MSO_DB_DSN environment variable is required")
+	}
+
+	geoCfg, err := geo.ConfigFromEnv()
+	if err != nil {
+		log.Fatal(err)
 	}
 
 	ctx := context.Background()
@@ -52,7 +62,9 @@ func main() {
 	log.Println("Starting MSO scrape. This will take several hours — that's intentional.")
 	log.Println("Data sourced from motorwayservices.uk — please ensure your app links back.")
 
-	err = scraper.Run(func(sa models.ServiceArea) error {
+	geocoder := geo.NewGeocoder(geoCfg, pool)
+
+	err = scraper.Run(geoCfg, geocoder, func(sa models.ServiceArea) error {
 		if err := pool.UpsertServiceArea(ctx, sa); err != nil {
 			// Log but don't abort — one bad page shouldn't stop the whole run
 			log.Printf("Failed to store %s: %v", sa.Name, err)

@@ -32,6 +32,9 @@ services:
     environment:
       MSO_DB_DSN: postgres://mso:msopassword@postgres:5432/mso?sslmode=disable
       PORT: "8080"
+      MSO_CONTACT: ${MSO_CONTACT:-}
+      NOMINATIM_URL: ${NOMINATIM_URL:-}
+      OSRM_URL: ${OSRM_URL:-}
     ports:
       - "127.0.0.1:${WEB_PORT:-8080}:8080"
     depends_on:
@@ -45,6 +48,8 @@ services:
       dockerfile: Dockerfile.scraper
     environment:
       MSO_DB_DSN: postgres://mso:msopassword@postgres:5432/mso?sslmode=disable
+      MSO_CONTACT: ${MSO_CONTACT:-}
+      NOMINATIM_URL: ${NOMINATIM_URL:-}
     depends_on:
       postgres:
         condition: service_healthy

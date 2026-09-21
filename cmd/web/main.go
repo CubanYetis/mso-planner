@@ -13,9 +13,9 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/BigRedS/mso-planner/internal/db"
+	"github.com/BigRedS/mso-planner/internal/geo"
 	"github.com/BigRedS/mso-planner/internal/models"
 )
 
@@ -34,10 +34,6 @@ var templates = template.Must(template.New("dashboard").Funcs(template.FuncMap{
 
 var osrmRoadRegexp = regexp.MustCompile(`\b([MA]\d+(?:\([^)]*\))?)\b`)
 
-var httpClient = &http.Client{
-	Timeout: 12 * time.Second,
-}
-
 type dashboardFilters struct {
 	Road     string
 	Operator string
@@ -48,10 +44,7 @@ type dashboardFilters struct {
 	Limit    int
 }
 
-type routePoint struct {
-	Lat float64 `json:"lat"`
-	Lon float64 `json:"lon"`
-}
+type routePoint = geo.Point
 
 type routeData struct {
 	Start       string
@@ -88,6 +81,11 @@ func main() {
 		log.Fatal("MSO_DB_DSN environment variable is required")
 	}
 
+	geoCfg, err := geo.ConfigFromEnv()
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	ctx := context.Background()
 	pool, err := db.Connect(ctx, dsn)
 	if err != nil {
@@ -100,7 +98,7 @@ func main() {
 		log.Fatalf("Migration failed: %v", err)
 	}
 
-	http.HandleFunc("/", makeHandler(pool))
+	http.HandleFunc("/", makeHandler(pool, geo.NewGeocoder(geoCfg, pool), geo.NewRouter(geoCfg)))
 	http.HandleFunc("/favicon.ico", http.NotFound)
 
 	addr := ":8080"
@@ -111,7 +109,7 @@ func main() {
 	log.Fatal(http.ListenAndServe(addr, nil))
 }
 
-func makeHandler(pool *db.Pool) http.HandlerFunc {
+func makeHandler(pool *db.Pool, gc *geo.Geocoder, rt *geo.Router) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		filters := parseFilters(r)
 		ctx := r.Context()
@@ -125,7 +123,7 @@ func makeHandler(pool *db.Pool) http.HandlerFunc {
 		var route routeData
 		var routeError string
 		if filters.Start != "" && filters.End != "" {
-			route, err = planRoute(ctx, filters.Start, filters.End)
+			route, err = planRoute(ctx, gc, rt, filters.Start, filters.End)
 			if err != nil {
 				routeError = fmt.Sprintf("route error: %v", err)
 			}
@@ -145,7 +143,7 @@ func makeHandler(pool *db.Pool) http.HandlerFunc {
 		}
 
 		if len(route.Geometry) > 0 {
-			filtered, err := filterServicesByRoute(ctx, pool, services, route)
+			filtered, err := filterServicesByRoute(ctx, pool, gc, services, route)
 			if err != nil {
 				renderTemplate(w, dashboardData{Error: fmt.Sprintf("could not filter services by route: %v", err)})
 				return
@@ -196,154 +194,49 @@ func parseFilters(r *http.Request) dashboardFilters {
 	}
 }
 
-type nominatimResult struct {
-	Lat string `json:"lat"`
-	Lon string `json:"lon"`
-}
-
-type osrmResponse struct {
-	Code   string `json:"code"`
-	Routes []struct {
-		Distance float64 `json:"distance"`
-		Duration float64 `json:"duration"`
-		Geometry struct {
-			Coordinates [][]float64 `json:"coordinates"`
-		} `json:"geometry"`
-		Legs []struct {
-			Steps []struct {
-				Name string `json:"name"`
-			} `json:"steps"`
-		} `json:"legs"`
-	} `json:"routes"`
-}
-
-func planRoute(ctx context.Context, start, end string) (routeData, error) {
-	startLat, startLon, err := geocodeAddress(ctx, start)
+func planRoute(ctx context.Context, gc *geo.Geocoder, rt *geo.Router, start, end string) (routeData, error) {
+	startLat, startLon, err := gc.Geocode(ctx, start)
 	if err != nil {
 		return routeData{}, fmt.Errorf("could not geocode start location: %w", err)
 	}
-	endLat, endLon, err := geocodeAddress(ctx, end)
+	endLat, endLon, err := gc.Geocode(ctx, end)
 	if err != nil {
 		return routeData{}, fmt.Errorf("could not geocode destination: %w", err)
 	}
 
-	route, err := fetchOSRMRoute(ctx, startLat, startLon, endLat, endLon)
+	r, err := rt.Route(ctx, geo.Point{Lat: startLat, Lon: startLon}, geo.Point{Lat: endLat, Lon: endLon})
 	if err != nil {
 		return routeData{}, err
 	}
 
-	route.Start = start
-	route.End = end
-	route.StartLat = startLat
-	route.StartLon = startLon
-	route.EndLat = endLat
-	route.EndLon = endLon
-	return route, nil
+	return routeData{
+		Start:       start,
+		End:         end,
+		StartLat:    startLat,
+		StartLon:    startLon,
+		EndLat:      endLat,
+		EndLon:      endLon,
+		Geometry:    r.Geometry,
+		Roads:       extractRoadNames(r.StepNames),
+		Distance:    r.Distance,
+		Duration:    r.Duration,
+		DistanceKM:  r.Distance / 1000,
+		DurationHrs: r.Duration / 3600,
+	}, nil
 }
 
-func geocodeAddress(ctx context.Context, query string) (float64, float64, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://nominatim.openstreetmap.org/search", nil)
-	if err != nil {
-		return 0, 0, err
-	}
-
-	q := req.URL.Query()
-	q.Set("q", query)
-	q.Set("format", "json")
-	q.Set("limit", "1")
-	q.Set("countrycodes", "gb")
-	req.URL.RawQuery = q.Encode()
-	req.Header.Set("User-Agent", "MSO-Planner/1.0 (route planner; contact: ialoneambest@gmail.com)")
-
-	res, err := httpClient.Do(req)
-	if err != nil {
-		return 0, 0, err
-	}
-	defer res.Body.Close()
-
-	if res.StatusCode != http.StatusOK {
-		return 0, 0, fmt.Errorf("geocoding failed: %s", res.Status)
-	}
-
-	var results []nominatimResult
-	if err := json.NewDecoder(res.Body).Decode(&results); err != nil {
-		return 0, 0, err
-	}
-	if len(results) == 0 {
-		return 0, 0, fmt.Errorf("no geocoding results")
-	}
-
-	lat, err := strconv.ParseFloat(results[0].Lat, 64)
-	if err != nil {
-		return 0, 0, err
-	}
-	lon, err := strconv.ParseFloat(results[0].Lon, 64)
-	if err != nil {
-		return 0, 0, err
-	}
-	return lat, lon, nil
-}
-
-func fetchOSRMRoute(ctx context.Context, startLat, startLon, endLat, endLon float64) (routeData, error) {
-	url := fmt.Sprintf("https://router.project-osrm.org/route/v1/driving/%.6f,%.6f;%.6f,%.6f?overview=full&geometries=geojson&steps=true", startLon, startLat, endLon, endLat)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return routeData{}, err
-	}
-	req.Header.Set("User-Agent", "MSO-Planner/1.0 (route planner; contact: BigRedS)")
-
-	res, err := httpClient.Do(req)
-	if err != nil {
-		return routeData{}, err
-	}
-	defer res.Body.Close()
-
-	if res.StatusCode != http.StatusOK {
-		return routeData{}, fmt.Errorf("routing failed: %s", res.Status)
-	}
-
-	var osrm osrmResponse
-	if err := json.NewDecoder(res.Body).Decode(&osrm); err != nil {
-		return routeData{}, err
-	}
-	if osrm.Code != "Ok" || len(osrm.Routes) == 0 {
-		return routeData{}, fmt.Errorf("routing response invalid: code=%s", osrm.Code)
-	}
-
-	route := routeData{
-		Geometry:    make([]routePoint, 0, len(osrm.Routes[0].Geometry.Coordinates)),
-		Distance:    osrm.Routes[0].Distance,
-		Duration:    osrm.Routes[0].Duration,
-		DistanceKM:  osrm.Routes[0].Distance / 1000,
-		DurationHrs: osrm.Routes[0].Duration / 3600,
-		Roads:       extractRoadNames(&osrm),
-	}
-
-	for _, coord := range osrm.Routes[0].Geometry.Coordinates {
-		if len(coord) == 2 {
-			route.Geometry = append(route.Geometry, routePoint{Lat: coord[1], Lon: coord[0]})
-		}
-	}
-
-	return route, nil
-}
-
-func extractRoadNames(osrm *osrmResponse) []string {
+func extractRoadNames(stepNames []string) []string {
 	seen := make(map[string]bool)
 	var roads []string
 
-	for _, route := range osrm.Routes {
-		for _, leg := range route.Legs {
-			for _, step := range leg.Steps {
-				road := normalizeRoadName(step.Name)
-				if road == "" {
-					continue
-				}
-				if !seen[road] {
-					seen[road] = true
-					roads = append(roads, road)
-				}
-			}
+	for _, name := range stepNames {
+		road := normalizeRoadName(name)
+		if road == "" {
+			continue
+		}
+		if !seen[road] {
+			seen[road] = true
+			roads = append(roads, road)
 		}
 	}
 
@@ -361,12 +254,12 @@ func normalizeRoadName(name string) string {
 const routeMatchDistanceMeters = 5000
 const earthRadiusMeters = 6371000.0
 
-func filterServicesByRoute(ctx context.Context, pool *db.Pool, services []models.ServiceArea, route routeData) ([]models.ServiceArea, error) {
+func filterServicesByRoute(ctx context.Context, pool *db.Pool, gc *geo.Geocoder, services []models.ServiceArea, route routeData) ([]models.ServiceArea, error) {
 	var out []models.ServiceArea
 	for i := range services {
 		sa := &services[i]
 		if sa.Latitude == 0 && sa.Longitude == 0 && sa.Postcode != "" {
-			if err := maybeGeocodeServiceCoordinates(ctx, pool, sa); err != nil {
+			if err := maybeGeocodeServiceCoordinates(ctx, pool, gc, sa); err != nil {
 				log.Printf("warning: could not geocode %s: %v", sa.Slug, err)
 			}
 		}
@@ -382,8 +275,8 @@ func filterServicesByRoute(ctx context.Context, pool *db.Pool, services []models
 	return out, nil
 }
 
-func maybeGeocodeServiceCoordinates(ctx context.Context, pool *db.Pool, sa *models.ServiceArea) error {
-	lat, lon, err := geocodeAddress(ctx, sa.Postcode)
+func maybeGeocodeServiceCoordinates(ctx context.Context, pool *db.Pool, gc *geo.Geocoder, sa *models.ServiceArea) error {
+	lat, lon, err := gc.Geocode(ctx, sa.Postcode)
 	if err != nil {
 		return err
 	}

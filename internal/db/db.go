@@ -4,6 +4,7 @@ package db
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -103,6 +104,15 @@ CREATE TABLE IF NOT EXISTS service_sources (
     rating          REAL,
     review_count    INTEGER,
     fetched_at      TIMESTAMPTZ
+);
+
+-- Geocoding results, so we hit Nominatim at most once per distinct query.
+-- query is normalised (lower-cased, whitespace collapsed) by the geo package.
+CREATE TABLE IF NOT EXISTS geocode_cache (
+    query       TEXT             PRIMARY KEY,
+    latitude    DOUBLE PRECISION NOT NULL,
+    longitude   DOUBLE PRECISION NOT NULL,
+    fetched_at  TIMESTAMPTZ      NOT NULL DEFAULT NOW()
 );
 
 CREATE INDEX IF NOT EXISTS idx_service_areas_road     ON service_areas(road);
@@ -210,6 +220,33 @@ func (p *Pool) UpdateServiceCoordinates(ctx context.Context, slug string, lat, l
 		SET latitude = $1, longitude = $2
 		WHERE slug = $3
 	`, lat, lon, slug)
+	return err
+}
+
+// GetGeocode returns a cached geocoding result. ok is false on a cache miss.
+func (p *Pool) GetGeocode(ctx context.Context, query string) (lat, lon float64, ok bool, err error) {
+	err = p.pool.QueryRow(ctx,
+		`SELECT latitude, longitude FROM geocode_cache WHERE query = $1`, query,
+	).Scan(&lat, &lon)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, 0, false, nil
+	}
+	if err != nil {
+		return 0, 0, false, err
+	}
+	return lat, lon, true, nil
+}
+
+// PutGeocode stores a geocoding result, replacing any existing entry.
+func (p *Pool) PutGeocode(ctx context.Context, query string, lat, lon float64) error {
+	_, err := p.pool.Exec(ctx, `
+		INSERT INTO geocode_cache (query, latitude, longitude, fetched_at)
+		VALUES ($1, $2, $3, NOW())
+		ON CONFLICT (query) DO UPDATE SET
+			latitude   = EXCLUDED.latitude,
+			longitude  = EXCLUDED.longitude,
+			fetched_at = NOW()
+	`, query, lat, lon)
 	return err
 }
 
