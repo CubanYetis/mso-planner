@@ -32,6 +32,7 @@ type Router struct {
 	http      *http.Client
 }
 
+// NewRouter builds an OSRM client from cfg.
 func NewRouter(cfg Config) *Router {
 	return &Router{
 		baseURL:   cfg.OSRMURL,

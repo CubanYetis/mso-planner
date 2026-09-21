@@ -73,6 +73,7 @@ type dashboardData struct {
 	RouteError      string
 }
 
+// main configures the application dependencies and starts the HTTP server.
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 
@@ -109,6 +110,7 @@ func main() {
 	log.Fatal(http.ListenAndServe(addr, nil))
 }
 
+// makeHandler builds the dashboard handler with its database and geo clients.
 func makeHandler(pool *db.Pool, gc *geo.Geocoder, rt *geo.Router) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		filters := parseFilters(r)
@@ -194,6 +196,7 @@ func parseFilters(r *http.Request) dashboardFilters {
 	}
 }
 
+// planRoute geocodes the endpoints and requests a driving route between them.
 func planRoute(ctx context.Context, gc *geo.Geocoder, rt *geo.Router, start, end string) (routeData, error) {
 	startLat, startLon, err := gc.Geocode(ctx, start)
 	if err != nil {
@@ -225,6 +228,7 @@ func planRoute(ctx context.Context, gc *geo.Geocoder, rt *geo.Router, start, end
 	}, nil
 }
 
+// extractRoadNames returns the unique motorway and A-road names in route order.
 func extractRoadNames(stepNames []string) []string {
 	seen := make(map[string]bool)
 	var roads []string
@@ -254,6 +258,7 @@ func normalizeRoadName(name string) string {
 const routeMatchDistanceMeters = 5000
 const earthRadiusMeters = 6371000.0
 
+// filterServicesByRoute returns services within the configured distance of a route.
 func filterServicesByRoute(ctx context.Context, pool *db.Pool, gc *geo.Geocoder, services []models.ServiceArea, route routeData) ([]models.ServiceArea, error) {
 	var out []models.ServiceArea
 	for i := range services {
@@ -275,6 +280,7 @@ func filterServicesByRoute(ctx context.Context, pool *db.Pool, gc *geo.Geocoder,
 	return out, nil
 }
 
+// maybeGeocodeServiceCoordinates fills and persists coordinates for a service.
 func maybeGeocodeServiceCoordinates(ctx context.Context, pool *db.Pool, gc *geo.Geocoder, sa *models.ServiceArea) error {
 	lat, lon, err := gc.Geocode(ctx, sa.Postcode)
 	if err != nil {

@@ -147,6 +147,7 @@ func Run(cfg geo.Config, gc *geo.Geocoder, onService OnServiceFunc) error {
 
 // ── Collector factory ─────────────────────────────────────────────────────────
 
+// newCollector builds a sequential, rate-limited collector for MSO pages.
 func newCollector(cfg geo.Config) *colly.Collector {
 	c := colly.NewCollector(
 		colly.AllowedDomains("motorwayservices.uk", "www.motorwayservices.uk", "motorwayservices.ie", "www.motorwayservices.ie"),
@@ -222,6 +223,7 @@ func buildServiceArea(e *colly.HTMLElement, listing models.RoadListing, gc *geo.
 	return sa
 }
 
+// maybeGeocodeServiceArea fills coordinates when the service has an address.
 func maybeGeocodeServiceArea(gc *geo.Geocoder, sa *models.ServiceArea) {
 	query := sa.Postcode
 	if query == "" {
