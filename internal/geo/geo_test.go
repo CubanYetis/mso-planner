@@ -15,6 +15,7 @@ import (
 	"github.com/BigRedS/mso-planner/internal/db"
 )
 
+// testConfig returns a fast configuration whose services use the test server.
 func testConfig(url string) Config {
 	return Config{NominatimURL: url, OSRMURL: url, Contact: "test@example.com"}
 }
@@ -31,10 +32,12 @@ func stub(t *testing.T, handler http.HandlerFunc) (*httptest.Server, *atomic.Int
 	return srv, &n
 }
 
+// okHandler returns a single successful Nominatim result.
 func okHandler(w http.ResponseWriter, _ *http.Request) {
 	fmt.Fprint(w, `[{"lat":"52.5","lon":"-1.25"}]`)
 }
 
+// TestConfigFromEnv verifies required and optional environment configuration.
 func TestConfigFromEnv(t *testing.T) {
 	t.Setenv("MSO_CONTACT", "")
 	if _, err := ConfigFromEnv(); err == nil {
@@ -59,6 +62,7 @@ func TestConfigFromEnv(t *testing.T) {
 	}
 }
 
+// TestGeocodeSuccess verifies request construction and response parsing.
 func TestGeocodeSuccess(t *testing.T) {
 	var got *http.Request
 	srv, _ := stub(t, func(w http.ResponseWriter, r *http.Request) {
@@ -83,6 +87,7 @@ func TestGeocodeSuccess(t *testing.T) {
 	}
 }
 
+// TestGeocodeErrors verifies malformed and unsuccessful upstream responses.
 func TestGeocodeErrors(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -113,6 +118,7 @@ func TestGeocodeErrors(t *testing.T) {
 	}
 }
 
+// TestGeocodeEmptyQueryMakesNoRequest verifies blank queries fail locally.
 func TestGeocodeEmptyQueryMakesNoRequest(t *testing.T) {
 	srv, n := stub(t, okHandler)
 	g := NewGeocoder(testConfig(srv.URL), nil)
@@ -125,6 +131,7 @@ func TestGeocodeEmptyQueryMakesNoRequest(t *testing.T) {
 	}
 }
 
+// TestGeocodeRetriesOn429 verifies rate-limit responses are retried.
 func TestGeocodeRetriesOn429(t *testing.T) {
 	var calls atomic.Int32
 	srv, n := stub(t, func(w http.ResponseWriter, r *http.Request) {
@@ -145,6 +152,7 @@ func TestGeocodeRetriesOn429(t *testing.T) {
 	}
 }
 
+// TestGeocodeGivesUpAfterRepeated429 verifies retries have a fixed limit.
 func TestGeocodeGivesUpAfterRepeated429(t *testing.T) {
 	srv, n := stub(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Retry-After", "0")
@@ -161,6 +169,7 @@ func TestGeocodeGivesUpAfterRepeated429(t *testing.T) {
 	}
 }
 
+// TestGeocodeDoesNotObeyVeryLongRetryAfter verifies excessive waits fail fast.
 func TestGeocodeDoesNotObeyVeryLongRetryAfter(t *testing.T) {
 	srv, n := stub(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Retry-After", "3600")
@@ -177,6 +186,7 @@ func TestGeocodeDoesNotObeyVeryLongRetryAfter(t *testing.T) {
 	}
 }
 
+// TestGeocodeSpacesRequests verifies the minimum upstream request interval.
 func TestGeocodeSpacesRequests(t *testing.T) {
 	srv, _ := stub(t, okHandler)
 	cfg := testConfig(srv.URL)
@@ -195,6 +205,7 @@ func TestGeocodeSpacesRequests(t *testing.T) {
 	}
 }
 
+// TestGeocodeStopsWhenContextCancelled verifies cancelled waits return promptly.
 func TestGeocodeStopsWhenContextCancelled(t *testing.T) {
 	srv, _ := stub(t, okHandler)
 	cfg := testConfig(srv.URL)
@@ -212,6 +223,7 @@ func TestGeocodeStopsWhenContextCancelled(t *testing.T) {
 	}
 }
 
+// TestGeocodeUsesCache verifies equivalent queries share a cached result.
 func TestGeocodeUsesCache(t *testing.T) {
 	dsn := os.Getenv("MSO_TEST_DSN")
 	if dsn == "" {
@@ -246,6 +258,7 @@ const osrmOK = `{"code":"Ok","routes":[{"distance":1500.5,"duration":90,
  "geometry":{"coordinates":[[-1.0,52.0],[-1.1,52.1],[5]]},
  "legs":[{"steps":[{"name":"M1"},{"name":""},{"name":"A14"}]},{"steps":[{"name":"M6"}]}]}]}`
 
+// TestRouterRoute verifies OSRM request construction and response conversion.
 func TestRouterRoute(t *testing.T) {
 	var got *http.Request
 	srv, _ := stub(t, func(w http.ResponseWriter, r *http.Request) {
@@ -276,6 +289,7 @@ func TestRouterRoute(t *testing.T) {
 	}
 }
 
+// TestRouterErrors verifies invalid OSRM responses return errors.
 func TestRouterErrors(t *testing.T) {
 	tests := []struct {
 		name    string

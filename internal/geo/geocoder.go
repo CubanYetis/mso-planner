@@ -92,6 +92,7 @@ func cacheKey(query string) string {
 	return strings.ToLower(strings.Join(strings.Fields(query), " "))
 }
 
+// fetch retries rate-limited geocoding requests up to the configured limit.
 func (g *Geocoder) fetch(ctx context.Context, query string) (float64, float64, error) {
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
@@ -209,6 +210,7 @@ func parseRetryAfter(v string) time.Duration {
 	return 2 * time.Second
 }
 
+// sleep waits for a duration or returns early when the context is cancelled.
 func sleep(ctx context.Context, d time.Duration) error {
 	if d <= 0 {
 		return ctx.Err()

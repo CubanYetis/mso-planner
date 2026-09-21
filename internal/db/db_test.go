@@ -31,6 +31,7 @@ func testPool(t *testing.T) *Pool {
 	return p
 }
 
+// TestGeocodeCache verifies cache misses, writes, and subsequent reads.
 func TestGeocodeCache(t *testing.T) {
 	p := testPool(t)
 	ctx := context.Background()

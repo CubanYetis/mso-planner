@@ -51,6 +51,7 @@ func (c Config) UserAgent() string {
 	return fmt.Sprintf("MSO-Planner/1.0 (+https://github.com/Cuban-Yetis/mso-planner; contact: %s)", c.Contact)
 }
 
+// envOr returns an environment value or def when the variable is unset.
 func envOr(key, def string) string {
 	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
 		return strings.TrimRight(v, "/")

@@ -29,6 +29,7 @@ import (
 	"github.com/BigRedS/mso-planner/internal/scraper"
 )
 
+// main configures the database and geocoder, then runs the scraper.
 func main() {
 	log.SetFlags(log.Ltime | log.Lshortfile)
 
