@@ -1,0 +1,20 @@
+language: en-GB
+reviews:
+  profile: assertive
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  auto_review:
+    enabled: true
+    drafts: false
+  path_filters:
+    - "!go.sum"
+  path_instructions:
+    - path: "**/*.go"
+      instructions: "Prefer simple, explicit code over abstractions. Pass dependencies (e.g. the DB pool) as arguments rather than using globals. Flag missing error handling, unbounded external calls, and untested logic."
+    - path: "**/*_test.go"
+      instructions: "Prefer table-driven tests. Prefer a real Postgres over mocks for database code."
+    - path: "docker-compose.yaml"
+      instructions: "The plaintext Postgres password is a deliberate dev-only credential for a throwaway database. Do not flag it."
+    - path: "internal/scraper/**"
+      instructions: "The scraper must stay polite to motorwayservices.uk (rate limits, honest User-Agent) and every record must keep its link back to MSO for attribution."
