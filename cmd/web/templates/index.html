@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MSO Planner Dashboard</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-sA+zPH5KDkoggmUpuwBCqPU/7Gghf77sPsPjJRId3m0=" crossorigin="" />
+  <style>
+    body { font-family: Inter, system-ui, sans-serif; margin: 0; background: #f5f7fb; color: #111827; }
+    .page { max-width: 1200px; margin: 0 auto; padding: 24px; }
+    h1, h2 { margin: 0 0 12px; }
+    .card { background: #ffffff; border: 1px solid #e5e7eb; border-radius: 16px; box-shadow: 0 1px 2px rgb(15 23 42 / 0.05); padding: 20px; margin-bottom: 24px; }
+    .stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; }
+    .stat { padding: 18px; border: 1px solid #e5e7eb; border-radius: 12px; background: #f8fafc; }
+    .stat strong { display: block; font-size: 1.8rem; line-height: 1; }
+    form { display: grid; gap: 16px; margin-top: 16px; }
+    .form-row { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; align-items: end; }
+    label { display: block; font-size: 0.9rem; font-weight: 600; margin-bottom: 6px; }
+    input[type="text"], input[type="number"] { width: 100%; padding: 10px 12px; border: 1px solid #d1d5db; border-radius: 10px; }
+    input[type="checkbox"] { margin-right: 8px; }
+    button { border: none; padding: 12px 18px; border-radius: 10px; background: #2563eb; color: white; font-weight: 700; cursor: pointer; }
+    button:hover { background: #1d4ed8; }
+    table { width: 100%; border-collapse: collapse; margin-top: 16px; }
+    th, td { text-align: left; padding: 12px 10px; border-bottom: 1px solid #e5e7eb; }
+    th { background: #f8fafc; font-weight: 700; }
+    a { color: #2563eb; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .error { color: #b91c1c; font-weight: 700; margin-bottom: 16px; }
+    .small { color: #6b7280; font-size: 0.95rem; }
+    .badge { display: inline-flex; align-items: center; gap: 6px; padding: 4px 8px; border-radius: 999px; background: #eef2ff; color: #3730a3; font-size: 0.85rem; }
+    #route-map { width: 100%; min-height: 420px; border-radius: 16px; border: 1px solid #d1d5db; }
+    .route-summary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; margin-top: 16px; }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <h1>MSO Planner Dashboard</h1>
+    <p class="small">Browse scraped motorway services and calculate a likely route on trunk roads.</p>
+
+    {{if .Error}}
+      <div class="error">{{.Error}}</div>
+    {{end}}
+
+    <div class="stats">
+      <div class="stat"><strong>{{.Total}}</strong> Services total</div>
+      <div class="stat"><strong>{{.WithFuel}}</strong> With fuel</div>
+      <div class="stat"><strong>{{.WithEV}}</strong> With EV charging</div>
+      <div class="stat"><strong>{{len .Services}}</strong> Shown</div>
+    </div>
+
+    <div class="card">
+      <h2>Filters</h2>
+      <form method="get" action="/">
+        <div class="form-row">
+          <div>
+            <label for="road">Road</label>
+            <input id="road" name="road" type="text" value="{{.Filters.Road}}" placeholder="e.g. M1, A1(M)">
+          </div>
+          <div>
+            <label for="operator">Operator</label>
+            <input id="operator" name="operator" type="text" value="{{.Filters.Operator}}" placeholder="Moto, Welcome Break">
+          </div>
+          <div>
+            <label>
+              <input type="checkbox" name="fuel" {{if .Filters.WithFuel}}checked{{end}}>
+              With fuel
+            </label>
+          </div>
+          <div>
+            <label>
+              <input type="checkbox" name="ev" {{if .Filters.WithEV}}checked{{end}}>
+              With EV charging
+            </label>
+          </div>
+        </div>
+        <div class="form-row">
+          <div>
+            <label for="start">Start</label>
+            <input id="start" name="start" type="text" value="{{.Filters.Start}}" placeholder="City, motorway junction, postcode...">
+          </div>
+          <div>
+            <label for="end">Destination</label>
+            <input id="end" name="end" type="text" value="{{.Filters.End}}" placeholder="City, motorway junction, postcode...">
+          </div>
+          <div>
+            <label for="limit">Result limit</label>
+            <input id="limit" name="limit" type="number" min="10" max="1000" value="{{.Filters.Limit}}">
+          </div>
+          <div style="display:flex; align-items:flex-end;">
+            <button type="submit">Search route</button>
+          </div>
+        </div>
+      </form>
+      {{if .RouteError}}
+        <div class="error">{{.RouteError}}</div>
+      {{end}}
+    </div>
+
+    {{if ne .RouteGeometryJS "null"}}
+    <div class="card">
+      <h2>Route summary</h2>
+      <div class="route-summary">
+        <div class="stat"><strong>{{printf "%.1f" .Route.DistanceKM}}</strong> km route</div>
+        <div class="stat"><strong>{{printf "%.1f" .Route.DurationHrs}}</strong> hours</div>
+        <div class="stat"><strong>{{len .Route.Roads}}</strong> trunk roads</div>
+      </div>
+      {{if .Route.Roads}}
+        <p class="small">Roads on the route: {{join .Route.Roads ", "}}</p>
+      {{else}}
+        <p class="small">Road shape is available, but no trunk road names were extracted from the route steps.</p>
+      {{end}}
+      <div id="route-map"></div>
+    </div>
+    {{end}}
+
+    <div class="card">
+      <h2>Service listings</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Road</th>
+            <th>Operator</th>
+            <th>Rating</th>
+            <th>Fuel</th>
+            <th>EV</th>
+            <th>Charge info</th>
+            <th>Location</th>
+          </tr>
+        </thead>
+        <tbody>
+          {{range .Services}}
+          <tr>
+            <td><a href="{{.MSOURL}}" target="_blank" rel="noreferrer noopener">{{.Name}}</a></td>
+            <td>{{.Road}}</td>
+            <td>{{.Operator}}</td>
+            <td>{{printf "%.1f" .MSOrating}}</td>
+            <td>{{if .Facilities.FuelBrands}}{{join .Facilities.FuelBrands ", "}}{{else}}—{{end}}</td>
+            <td>{{yesno .Facilities.EVCharging}}</td>
+            <td>{{if .Facilities.EVChargerInfo}}{{.Facilities.EVChargerInfo}}{{else}}—{{end}}</td>
+            <td>{{.Location}}</td>
+          </tr>
+          {{end}}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-o9N1jE2a3uNKQL4hWyR7s4Ab70Z6v+I5Uf+p7JMM5mM=" crossorigin=""></script>
+  <script>
+    const routeGeometry = {{.RouteGeometryJS}};
+    if (routeGeometry && routeGeometry.length) {
+      const map = L.map('route-map');
+      const routeLine = L.polyline(routeGeometry.map(p => [p.lat, p.lon]), { color: '#2563eb', weight: 5, opacity: 0.8 }).addTo(map);
+      const bounds = routeLine.getBounds();
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '&copy; OpenStreetMap contributors',
+        maxZoom: 18,
+      }).addTo(map);
+      map.fitBounds(bounds.pad(0.2));
+    }
+  </script>
+</body>
+</html>

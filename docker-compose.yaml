@@ -1,0 +1,53 @@
+# Local development only. Postgres is external in production, so this file
+# exists purely to give dev a throwaway database.
+#
+#   docker compose up -d                  # just Postgres (localhost:5432)
+#   docker compose --profile app up web   # Postgres + web UI on :8080
+#   docker compose --profile scraper run --rm scraper   # full scrape, 2-4 hours
+#
+# The password below is a deliberate, committed dev credential for a
+# throwaway database holding only public scraped data.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: mso
+      POSTGRES_USER: mso
+      POSTGRES_PASSWORD: msopassword
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mso -d mso"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  web:
+    profiles: [app]
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    environment:
+      MSO_DB_DSN: postgres://mso:msopassword@postgres:5432/mso?sslmode=disable
+      PORT: "8080"
+    ports:
+      - "127.0.0.1:${WEB_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  scraper:
+    profiles: [scraper]
+    build:
+      context: .
+      dockerfile: Dockerfile.scraper
+    environment:
+      MSO_DB_DSN: postgres://mso:msopassword@postgres:5432/mso?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:

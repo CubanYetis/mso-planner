@@ -1,0 +1,26 @@
+# Built binaries
+/bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binaries and coverage output
+*.test
+*.out
+coverage.*
+
+# Go workspace files
+go.work
+go.work.sum
+
+# Local environment / secrets
+.env
+.env.*
+
+# Editor / OS cruft
+.idea/
+.vscode/
+*.swp
+.DS_Store

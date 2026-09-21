@@ -1,0 +1,22 @@
+# syntax=docker/dockerfile:1
+
+# ── Build stage ───────────────────────────────────────────────────────────────
+FROM golang:1.22-alpine AS builder
+
+WORKDIR /src
+
+# Download dependencies first (cached layer)
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy source and build
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /bin/scraper ./cmd/scraper
+
+# ── Runtime stage ─────────────────────────────────────────────────────────────
+# Distroless: no shell, no package manager — just the binary
+FROM gcr.io/distroless/static-debian12
+
+COPY --from=builder /bin/scraper /scraper
+
+ENTRYPOINT ["/scraper"]
