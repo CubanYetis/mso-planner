@@ -155,7 +155,8 @@ func TestDeduplicateListings(t *testing.T) {
 		{URL: "https://motorwayservices.uk/Donington", Road: "A42"},
 	}
 	got := deduplicateListings(in)
-	if len(got) != 2 || got[0].Road != "M1" {
-		t.Errorf("got %+v, want 2 listings keeping the first Donington (M1)", got)
+	want := []models.RoadListing{in[0], in[1]}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %+v, want %+v (first Donington kept, order preserved)", got, want)
 	}
 }
