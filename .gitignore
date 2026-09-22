@@ -1,5 +1,8 @@
 # Built binaries
 /bin/
+# `go build ./cmd/x` (no -o) writes a binary here named after the package.
+/scraper
+/web
 *.exe
 *.exe~
 *.dll

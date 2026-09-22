@@ -83,6 +83,10 @@ docker compose --profile app up web
 
 Open <http://localhost:8080> and enter a start and destination.
 
+`/healthz` reports whether the database is reachable (200/503), for a
+container health check. SIGINT/SIGTERM trigger a graceful shutdown: the
+server stops accepting new requests but finishes in-flight ones first.
+
 ### Tests
 
 Most tests need nothing. The database-backed ones skip unless `MSO_TEST_DSN`

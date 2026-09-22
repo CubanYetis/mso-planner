@@ -4,6 +4,7 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/BigRedS/mso-planner/internal/geo"
 	"github.com/BigRedS/mso-planner/internal/models"
 )
 
@@ -159,5 +160,16 @@ func TestDeduplicateListings(t *testing.T) {
 	want := []models.RoadListing{in[0], in[1]}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("got %+v, want %+v (first Donington kept, order preserved)", got, want)
+	}
+}
+
+// newCollector must stay genuinely synchronous. colly v2.1.0's Async(...)
+// option ignores the bool passed to it and always sets Async=true, so the
+// fix is to not call it at all; asserting the zero value here catches that
+// option being added back by mistake.
+func TestNewCollectorIsSynchronous(t *testing.T) {
+	cfg := geo.Config{Contact: "test@example.com"}
+	if c := newCollector(cfg); c.Async {
+		t.Error("newCollector's Collector.Async is true, want false (see the comment on the call in newCollector)")
 	}
 }
