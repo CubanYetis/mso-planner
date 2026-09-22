@@ -43,7 +43,12 @@ type OnServiceFunc func(sa models.ServiceArea) error
 //
 // The caller controls persistence via onService — typically writing to Postgres.
 // Coordinates come from gc, which rate-limits and caches its lookups.
-func Run(cfg geo.Config, gc *geo.Geocoder, onService OnServiceFunc) error {
+//
+// ctx is checked between requests (road pages, then detail pages), so
+// cancelling it stops the scrape promptly rather than after the full ~40
+// minute run. It does not abort a request already in flight: colly does not
+// take a context, so the current page is always allowed to finish.
+func Run(ctx context.Context, cfg geo.Config, gc *geo.Geocoder, onService OnServiceFunc) error {
 	// Collect road URLs first, then listings, then details.
 	// We use three separate collectors so we can handle each phase distinctly.
 
@@ -106,10 +111,14 @@ func Run(cfg geo.Config, gc *geo.Geocoder, onService OnServiceFunc) error {
 	})
 
 	for _, road := range roads {
+		if ctx.Err() != nil {
+			log.Printf("Stopping: %v", ctx.Err())
+			return ctx.Err()
+		}
 		log.Printf("Fetching road page: %s", road.Road)
-		ctx := colly.NewContext()
-		ctx.Put("road", road.Road)
-		if err := roadCollector.Request("GET", road.URL, nil, ctx, nil); err != nil {
+		rc := colly.NewContext()
+		rc.Put("road", road.Road)
+		if err := roadCollector.Request("GET", road.URL, nil, rc, nil); err != nil {
 			log.Printf("Warning: failed to fetch %s: %v", road.URL, err)
 		}
 	}
@@ -125,17 +134,21 @@ func Run(cfg geo.Config, gc *geo.Geocoder, onService OnServiceFunc) error {
 
 	detailCollector.OnHTML("body", func(e *colly.HTMLElement) {
 		listing := listingFromContext(e.Request.Ctx)
-		sa := buildServiceArea(e, listing, gc)
+		sa := buildServiceArea(ctx, e, listing, gc)
 		if err := onService(sa); err != nil {
 			log.Printf("Error persisting %s: %v", sa.Name, err)
 		}
 	})
 
 	for _, listing := range listings {
+		if ctx.Err() != nil {
+			log.Printf("Stopping: %v", ctx.Err())
+			return ctx.Err()
+		}
 		log.Printf("Fetching detail: %s", listing.Name)
-		ctx := colly.NewContext()
-		storeListingInContext(ctx, listing)
-		if err := detailCollector.Request("GET", listing.URL, nil, ctx, nil); err != nil {
+		dc := colly.NewContext()
+		storeListingInContext(dc, listing)
+		if err := detailCollector.Request("GET", listing.URL, nil, dc, nil); err != nil {
 			log.Printf("Warning: failed to fetch detail for %s: %v", listing.Name, err)
 		}
 	}
@@ -151,7 +164,13 @@ func Run(cfg geo.Config, gc *geo.Geocoder, onService OnServiceFunc) error {
 func newCollector(cfg geo.Config) *colly.Collector {
 	c := colly.NewCollector(
 		colly.AllowedDomains("motorwayservices.uk", "www.motorwayservices.uk", "motorwayservices.ie", "www.motorwayservices.ie"),
-		colly.Async(false), // sequential — we're being polite
+		// No colly.Async(...) option here: in colly v2.1.0 it unconditionally
+		// sets Async=true regardless of the bool passed in (colly.Async(false)
+		// still turns it on), so requests run one goroutine per Visit/Request
+		// with only Parallelism enforcing serialization. Leaving Async at its
+		// zero value (false) is the only way to get genuinely synchronous,
+		// one-request-at-a-time fetching, which the code below relies on to
+		// react to a cancelled context between requests.
 	)
 
 	// Identify ourselves honestly
@@ -176,7 +195,7 @@ func newCollector(cfg geo.Config) *colly.Collector {
 
 // buildServiceArea extracts structured data from a services detail page.
 // MSO pages are MediaWiki-based and have a consistent structure.
-func buildServiceArea(e *colly.HTMLElement, listing models.RoadListing, gc *geo.Geocoder) models.ServiceArea {
+func buildServiceArea(ctx context.Context, e *colly.HTMLElement, listing models.RoadListing, gc *geo.Geocoder) models.ServiceArea {
 	sa := models.ServiceArea{
 		Slug:          slugFromURL(listing.URL),
 		Name:          listing.Name,
@@ -201,7 +220,7 @@ func buildServiceArea(e *colly.HTMLElement, listing models.RoadListing, gc *geo.
 	sa.Postcode = extractPostcode(sa.Address)
 
 	// Geocode coordinates now so the web UI doesn't need to do this later.
-	maybeGeocodeServiceArea(gc, &sa)
+	maybeGeocodeServiceArea(ctx, gc, &sa)
 
 	// Facilities — parse the structured facility section that MSO uses.
 	// MSO pages often render these as styled <span> blocks rather than plain <li>/<p> tags.
@@ -224,7 +243,7 @@ func buildServiceArea(e *colly.HTMLElement, listing models.RoadListing, gc *geo.
 }
 
 // maybeGeocodeServiceArea fills coordinates when the service has an address.
-func maybeGeocodeServiceArea(gc *geo.Geocoder, sa *models.ServiceArea) {
+func maybeGeocodeServiceArea(ctx context.Context, gc *geo.Geocoder, sa *models.ServiceArea) {
 	query := sa.Postcode
 	if query == "" {
 		query = sa.Address
@@ -233,7 +252,7 @@ func maybeGeocodeServiceArea(gc *geo.Geocoder, sa *models.ServiceArea) {
 		return
 	}
 
-	lat, lon, err := gc.Geocode(context.Background(), query)
+	lat, lon, err := gc.Geocode(ctx, query)
 	if err != nil {
 		log.Printf("warning: could not geocode %s: %v", sa.Name, err)
 		return

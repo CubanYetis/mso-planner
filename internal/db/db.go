@@ -36,6 +36,11 @@ func (p *Pool) Close() {
 	p.pool.Close()
 }
 
+// Ping checks that the database is reachable, for use by a health check.
+func (p *Pool) Ping(ctx context.Context) error {
+	return p.pool.Ping(ctx)
+}
+
 // Migrate creates the schema if it doesn't exist.
 // We keep migrations inline here for simplicity; for a real project
 // you'd use golang-migrate or similar.
