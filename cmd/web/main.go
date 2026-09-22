@@ -4,19 +4,33 @@ import (
 	"context"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
-	"log"
+	"log/slog"
 	"math"
 	"net/http"
 	"os"
+	"os/signal"
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/BigRedS/mso-planner/internal/db"
 	"github.com/BigRedS/mso-planner/internal/geo"
 	"github.com/BigRedS/mso-planner/internal/models"
+)
+
+const (
+	readHeaderTimeout = 5 * time.Second
+	readTimeout       = 15 * time.Second
+	// Planning a route makes two sequential geocode calls plus one routing
+	// call, each with its own ~12s upstream timeout, so this needs headroom.
+	writeTimeout    = 40 * time.Second
+	idleTimeout     = 2 * time.Minute
+	shutdownTimeout = 10 * time.Second
 )
 
 //go:embed templates/*.html
@@ -76,41 +90,103 @@ type dashboardData struct {
 	RouteError      string
 }
 
-// main configures the application dependencies and starts the HTTP server.
+// main configures the application dependencies and starts the HTTP server. It
+// shuts down gracefully on SIGINT/SIGTERM, finishing in-flight requests
+// before the process exits.
 func main() {
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	slog.SetDefault(logger)
 
 	dsn := os.Getenv("MSO_DB_DSN")
 	if dsn == "" {
-		log.Fatal("MSO_DB_DSN environment variable is required")
+		logger.Error("MSO_DB_DSN environment variable is required")
+		os.Exit(1)
 	}
 
 	geoCfg, err := geo.ConfigFromEnv()
 	if err != nil {
-		log.Fatal(err)
+		logger.Error(err.Error())
+		os.Exit(1)
 	}
 
-	ctx := context.Background()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
 	pool, err := db.Connect(ctx, dsn)
 	if err != nil {
-		log.Fatalf("Database connection failed: %v", err)
+		logger.Error("database connection failed", "error", err)
+		os.Exit(1)
 	}
 	defer pool.Close()
 
-	log.Println("Running migrations...")
+	logger.Info("running migrations")
 	if err := pool.Migrate(ctx); err != nil {
-		log.Fatalf("Migration failed: %v", err)
+		logger.Error("migration failed", "error", err)
+		os.Exit(1)
 	}
 
-	http.HandleFunc("/", makeHandler(pool, geo.NewGeocoder(geoCfg, pool), geo.NewRouter(geoCfg)))
-	http.HandleFunc("/favicon.ico", http.NotFound)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", makeHandler(pool, geo.NewGeocoder(geoCfg, pool), geo.NewRouter(geoCfg)))
+	mux.HandleFunc("/healthz", makeHealthzHandler(pool))
+	mux.HandleFunc("/favicon.ico", http.NotFound)
 
 	addr := ":8080"
 	if port := os.Getenv("PORT"); port != "" {
 		addr = ":" + port
 	}
-	log.Printf("Dashboard listening on http://localhost%s", addr)
-	log.Fatal(http.ListenAndServe(addr, nil))
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: readHeaderTimeout,
+		ReadTimeout:       readTimeout,
+		WriteTimeout:      writeTimeout,
+		IdleTimeout:       idleTimeout,
+	}
+
+	serveErr := make(chan error, 1)
+	go func() {
+		logger.Info("dashboard listening", "addr", addr)
+		serveErr <- srv.ListenAndServe()
+	}()
+
+	select {
+	case err := <-serveErr:
+		if !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("server failed", "error", err)
+			os.Exit(1)
+		}
+	case <-ctx.Done():
+		logger.Info("shutting down: signal received")
+		stop() // restore default signal behaviour so a second signal force-quits
+
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			logger.Error("graceful shutdown failed", "error", err)
+			os.Exit(1)
+		}
+		logger.Info("shut down cleanly")
+	}
+}
+
+// pinger is satisfied by *db.Pool; declared narrowly here so /healthz is
+// testable without a real database.
+type pinger interface {
+	Ping(ctx context.Context) error
+}
+
+// makeHealthzHandler reports whether the database is reachable. It is meant
+// for a Kubernetes liveness/readiness probe.
+func makeHealthzHandler(p pinger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if err := p.Ping(r.Context()); err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			fmt.Fprintf(w, "database unreachable: %v\n", err)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintln(w, "ok")
+	}
 }
 
 // makeHandler builds the dashboard handler with its database and geo clients.
@@ -282,7 +358,7 @@ func filterServicesByRoute(ctx context.Context, pool *db.Pool, gc *geo.Geocoder,
 		sa := &services[i]
 		if sa.Latitude == 0 && sa.Longitude == 0 && sa.Postcode != "" {
 			if err := maybeGeocodeServiceCoordinates(ctx, pool, gc, sa); err != nil {
-				log.Printf("warning: could not geocode %s: %v", sa.Slug, err)
+				slog.Warn("could not geocode service", "slug", sa.Slug, "error", err)
 			}
 		}
 
@@ -375,6 +451,6 @@ func renderTemplate(w http.ResponseWriter, data dashboardData) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := templates.ExecuteTemplate(w, "index.html", data); err != nil {
 		http.Error(w, "template rendering failed", http.StatusInternalServerError)
-		log.Printf("template error: %v", err)
+		slog.Error("template rendering failed", "error", err)
 	}
 }
