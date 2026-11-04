@@ -164,12 +164,10 @@ func makeHandler(pool *db.Pool, gc *geo.Geocoder, rt *geo.Router) http.HandlerFu
 		if len(route.Geometry) > 0 {
 			// With a route planned, only the honest answer will do: if nothing
 			// matches, the table is empty rather than silently reverting to
-			// the unfiltered road list.
-			services, err = filterServicesByRoute(ctx, pool, gc, listed, route)
-			if err != nil {
-				renderTemplate(w, dashboardData{Error: fmt.Sprintf("could not filter services by route: %v", err)})
-				return
-			}
+			// the unfiltered road list. Services are matched on coordinates
+			// captured at scrape time — none are geocoded here, while a user
+			// waits; services without coordinates simply don't appear.
+			services = servicesNearRoute(listed, route.Geometry)
 		}
 
 		routeJSON := template.JS("null")
@@ -289,20 +287,6 @@ func normalizeRoadName(name string) string {
 const routeMatchDistanceMeters = 5000
 const earthRadiusMeters = 6371000.0
 
-// filterServicesByRoute fills in missing coordinates, then keeps only the
-// services near the route, in journey order.
-func filterServicesByRoute(ctx context.Context, pool *db.Pool, gc *geo.Geocoder, services []models.ServiceArea, route routeData) ([]routeService, error) {
-	for i := range services {
-		sa := &services[i]
-		if sa.Latitude == 0 && sa.Longitude == 0 && sa.Postcode != "" {
-			if err := maybeGeocodeServiceCoordinates(ctx, pool, gc, sa); err != nil {
-				log.Printf("warning: could not geocode %s: %v", sa.Slug, err)
-			}
-		}
-	}
-	return servicesNearRoute(services, route.Geometry), nil
-}
-
 // servicesNearRoute returns the services within the matching distance of the
 // route that serve the direction of travel, ordered by how far along the
 // route their closest point falls. Services without coordinates can't be
@@ -360,17 +344,6 @@ func wrapServices(services []models.ServiceArea) []routeService {
 		out[i] = routeService{ServiceArea: sa}
 	}
 	return out
-}
-
-// maybeGeocodeServiceCoordinates fills and persists coordinates for a service.
-func maybeGeocodeServiceCoordinates(ctx context.Context, pool *db.Pool, gc *geo.Geocoder, sa *models.ServiceArea) error {
-	lat, lon, err := gc.Geocode(ctx, sa.Postcode)
-	if err != nil {
-		return err
-	}
-	sa.Latitude = lat
-	sa.Longitude = lon
-	return pool.UpdateServiceCoordinates(ctx, sa.Slug, lat, lon)
 }
 
 // routeMatch describes a point's relationship to a route: how far off the
