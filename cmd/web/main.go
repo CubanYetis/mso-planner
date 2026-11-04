@@ -160,18 +160,16 @@ func makeHandler(pool *db.Pool, gc *geo.Geocoder, rt *geo.Router) http.HandlerFu
 			return
 		}
 
-		var services []routeService
+		services := wrapServices(listed)
 		if len(route.Geometry) > 0 {
+			// With a route planned, only the honest answer will do: if nothing
+			// matches, the table is empty rather than silently reverting to
+			// the unfiltered road list.
 			services, err = filterServicesByRoute(ctx, pool, gc, listed, route)
 			if err != nil {
 				renderTemplate(w, dashboardData{Error: fmt.Sprintf("could not filter services by route: %v", err)})
 				return
 			}
-			if len(services) == 0 {
-				services = wrapServices(listed)
-			}
-		} else {
-			services = wrapServices(listed)
 		}
 
 		routeJSON := template.JS("null")
