@@ -93,40 +93,87 @@ func TestDistancePointToSegmentMeters(t *testing.T) {
 	tests := []struct {
 		name     string
 		lat, lon float64
-		want     float64
+		wantDist float64
+		wantT    float64
 		tol      float64
 	}{
-		{"on the segment", 52, -0.95, 0, 1},
-		{"beside the middle", 52.01, -0.95, 1112, 15},
-		{"beyond end a", 52, -1.01, 685, 15},
-		{"beyond end b", 52, -0.89, 685, 15},
+		{"on the segment", 52, -0.95, 0, 0.5, 1},
+		{"beside the middle", 52.01, -0.95, 1112, 0.5, 15},
+		{"beyond end a", 52, -1.01, 685, 0, 15},
+		{"beyond end b", 52, -0.89, 685, 1, 15},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := distancePointToSegmentMeters(tt.lat, tt.lon, a, b)
-			if math.Abs(got-tt.want) > tt.tol {
-				t.Errorf("got %.0f m, want %.0f m (+/- %.0f)", got, tt.want, tt.tol)
+			dist, proj := distancePointToSegmentMeters(tt.lat, tt.lon, a, b)
+			if math.Abs(dist-tt.wantDist) > tt.tol {
+				t.Errorf("dist = %.0f m, want %.0f m (+/- %.0f)", dist, tt.wantDist, tt.tol)
+			}
+			if math.Abs(proj-tt.wantT) > 0.02 {
+				t.Errorf("t = %.2f, want %.2f", proj, tt.wantT)
 			}
 		})
 	}
 
 	t.Run("degenerate segment is a point", func(t *testing.T) {
-		got := distancePointToSegmentMeters(52.01, -1, a, a)
-		if math.Abs(got-1112) > 15 {
-			t.Errorf("got %.0f m, want ~1112", got)
+		dist, proj := distancePointToSegmentMeters(52.01, -1, a, a)
+		if math.Abs(dist-1112) > 15 {
+			t.Errorf("dist = %.0f m, want ~1112", dist)
+		}
+		if proj != 0 {
+			t.Errorf("t = %.2f, want 0", proj)
 		}
 	})
 }
 
-func TestPointToRouteDistance(t *testing.T) {
-	if got := pointToRouteDistance(52, -1, nil); got != math.MaxFloat64 {
-		t.Errorf("empty route = %v, want MaxFloat64", got)
+func TestNearestOnRoute(t *testing.T) {
+	if _, ok := nearestOnRoute(52, -1, nil); ok {
+		t.Error("empty route: ok = true, want false")
+	}
+	if _, ok := nearestOnRoute(52, -1, []routePoint{{Lat: 52, Lon: -1}}); ok {
+		t.Error("single point: ok = true, want false")
 	}
 
 	route := []routePoint{{Lat: 52, Lon: -1}, {Lat: 52, Lon: -0.9}, {Lat: 52.1, Lon: -0.9}}
+
 	// Nearest to the second (north-south) segment, not the first.
-	got := pointToRouteDistance(52.05, -0.89, route)
-	if got > 800 {
-		t.Errorf("got %.0f m, want < 800 (~685)", got)
+	m, ok := nearestOnRoute(52.05, -0.89, route)
+	if !ok {
+		t.Fatal("ok = false, want true")
+	}
+	if m.distMeters > 800 {
+		t.Errorf("dist = %.0f m, want < 800 (~685)", m.distMeters)
+	}
+
+	// Along is the first segment plus halfway up the second.
+	wantAlong := haversineMeters(52, -1, 52, -0.9) + haversineMeters(52, -0.9, 52.05, -0.9)
+	if math.Abs(m.alongMeters-wantAlong) > 15 {
+		t.Errorf("along = %.0f m, want %.0f m", m.alongMeters, wantAlong)
+	}
+
+	// The winning segment runs due north.
+	if math.Abs(m.bearing-0) > 1 && math.Abs(m.bearing-360) > 1 {
+		t.Errorf("bearing = %.1f, want ~0", m.bearing)
+	}
+}
+
+func TestBearingDegrees(t *testing.T) {
+	origin := routePoint{Lat: 52, Lon: -1}
+	tests := []struct {
+		name string
+		to   routePoint
+		want float64
+	}{
+		{"due north", routePoint{Lat: 53, Lon: -1}, 0},
+		{"due east", routePoint{Lat: 52, Lon: 0}, 90},
+		{"due south", routePoint{Lat: 51, Lon: -1}, 180},
+		{"due west", routePoint{Lat: 52, Lon: -2}, 270},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := bearingDegrees(origin, tt.to)
+			if math.Abs(got-tt.want) > 1 {
+				t.Errorf("got %.1f, want %.1f", got, tt.want)
+			}
+		})
 	}
 }
