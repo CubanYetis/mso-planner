@@ -105,3 +105,45 @@ func TestListServicesNullColumns(t *testing.T) {
 		t.Error("inserted service not returned by ListServices")
 	}
 }
+
+// TestListServicesMissingCoordinates checks that NULL and zero coordinates
+// are both treated as missing, and real coordinates are not.
+func TestListServicesMissingCoordinates(t *testing.T) {
+	p := testPool(t)
+	ctx := context.Background()
+	prefix := fmt.Sprintf("missing-coords-%d", time.Now().UnixNano())
+
+	insert := func(slug string, lat, lon interface{}) {
+		t.Helper()
+		if _, err := p.pool.Exec(ctx, `
+			INSERT INTO service_areas (slug, name, mso_url, road, direction, postcode, latitude, longitude)
+			VALUES ($1, $1, 'https://example.com/'||$1, 'M1', 'both', 'LE1 1AA', $2, $3)
+		`, slug, lat, lon); err != nil {
+			t.Fatalf("inserting %s: %v", slug, err)
+		}
+	}
+	insert(prefix+"-null", nil, nil)
+	insert(prefix+"-zero", 0, 0)
+	insert(prefix+"-geocoded", 52.5, -1.25)
+	t.Cleanup(func() {
+		p.pool.Exec(ctx, `DELETE FROM service_areas WHERE slug LIKE $1`, prefix+"%")
+	})
+
+	missing, err := p.ListServicesMissingCoordinates(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, sa := range missing {
+		got[sa.Slug] = true
+		if sa.Postcode != "LE1 1AA" {
+			t.Errorf("%s: postcode = %q, want LE1 1AA", sa.Slug, sa.Postcode)
+		}
+	}
+	if !got[prefix+"-null"] || !got[prefix+"-zero"] {
+		t.Errorf("null and zero rows should be missing coordinates, got %v", got)
+	}
+	if got[prefix+"-geocoded"] {
+		t.Error("geocoded row reported as missing coordinates")
+	}
+}

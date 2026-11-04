@@ -223,6 +223,32 @@ func (p *Pool) UpdateServiceCoordinates(ctx context.Context, slug string, lat, l
 	return err
 }
 
+// ListServicesMissingCoordinates returns services with no usable coordinates
+// (never geocoded, or geocoding failed at scrape time), for the backfill
+// command. Only the fields geocoding needs are populated.
+func (p *Pool) ListServicesMissingCoordinates(ctx context.Context) ([]models.ServiceArea, error) {
+	rows, err := p.pool.Query(ctx, `
+		SELECT slug, COALESCE(postcode, ''), COALESCE(address, '')
+		FROM service_areas
+		WHERE COALESCE(latitude, 0) = 0 AND COALESCE(longitude, 0) = 0
+		ORDER BY slug
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []models.ServiceArea
+	for rows.Next() {
+		var sa models.ServiceArea
+		if err := rows.Scan(&sa.Slug, &sa.Postcode, &sa.Address); err != nil {
+			return nil, err
+		}
+		out = append(out, sa)
+	}
+	return out, rows.Err()
+}
+
 // GetGeocode returns a cached geocoding result. ok is false on a cache miss.
 func (p *Pool) GetGeocode(ctx context.Context, query string) (lat, lon float64, ok bool, err error) {
 	err = p.pool.QueryRow(ctx,
