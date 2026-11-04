@@ -1,6 +1,7 @@
 package main
 
 import (
+	"io"
 	"math"
 	"reflect"
 	"testing"
@@ -226,6 +227,23 @@ func TestServicesNearRouteFiltersDirection(t *testing.T) {
 	want := []string{"northbound-side", "online-both"}
 	if !reflect.DeepEqual(order, want) {
 		t.Errorf("order = %v, want %v", order, want)
+	}
+}
+
+// TestTemplateRenders guards the field references in index.html — a typo in
+// the template fails at runtime, not at build time, without this.
+func TestTemplateRenders(t *testing.T) {
+	data := dashboardData{
+		Services: []routeService{
+			{ServiceArea: models.ServiceArea{Name: "Test Services"}, AlongMeters: 42000},
+		},
+		Route: routeData{Geometry: []routePoint{{Lat: 52, Lon: -1}, {Lat: 53, Lon: -1}}},
+	}
+	if err := templates.ExecuteTemplate(io.Discard, "index.html", data); err != nil {
+		t.Fatalf("render with route: %v", err)
+	}
+	if err := templates.ExecuteTemplate(io.Discard, "index.html", dashboardData{}); err != nil {
+		t.Fatalf("render without route: %v", err)
 	}
 }
 
