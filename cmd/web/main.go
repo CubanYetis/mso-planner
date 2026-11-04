@@ -306,8 +306,9 @@ func filterServicesByRoute(ctx context.Context, pool *db.Pool, gc *geo.Geocoder,
 }
 
 // servicesNearRoute returns the services within the matching distance of the
-// route, ordered by how far along the route their closest point falls.
-// Services without coordinates can't be placed and are dropped.
+// route that serve the direction of travel, ordered by how far along the
+// route their closest point falls. Services without coordinates can't be
+// placed and are dropped.
 func servicesNearRoute(services []models.ServiceArea, geometry []routePoint) []routeService {
 	var out []routeService
 	for _, sa := range services {
@@ -318,10 +319,41 @@ func servicesNearRoute(services []models.ServiceArea, geometry []routePoint) []r
 		if !ok || m.distMeters > routeMatchDistanceMeters {
 			continue
 		}
+		if !directionMatchesBearing(sa.Direction, m.bearing) {
+			continue
+		}
 		out = append(out, routeService{ServiceArea: sa, AlongMeters: m.alongMeters})
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].AlongMeters < out[j].AlongMeters })
 	return out
+}
+
+// directionConeHalfAngleDegrees is how far the route's heading may drift from
+// a service's signed direction before we decide it serves the other
+// carriageway. Motorways bend, so the cones are wide.
+const directionConeHalfAngleDegrees = 45.0
+
+// directionMatchesBearing reports whether a service signed for direction is
+// useful when travelling on the given bearing. "both" (online and junction
+// services) always matches, as do clockwise/anticlockwise: deciding those
+// needs the ring road's centre and there are few of them, so they stay
+// unfiltered for now.
+func directionMatchesBearing(direction string, bearing float64) bool {
+	var want float64
+	switch direction {
+	case "northbound":
+		want = 0
+	case "eastbound":
+		want = 90
+	case "southbound":
+		want = 180
+	case "westbound":
+		want = 270
+	default:
+		return true
+	}
+	diff := math.Abs(math.Mod(bearing-want+540, 360) - 180)
+	return diff <= directionConeHalfAngleDegrees
 }
 
 func wrapServices(services []models.ServiceArea) []routeService {
