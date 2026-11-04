@@ -313,13 +313,18 @@ type ListServicesOptions struct {
 }
 
 func (p *Pool) ListServices(ctx context.Context, opts ListServicesOptions) ([]models.ServiceArea, error) {
+	// Nullable text columns are COALESCEd to "" because the scan targets are
+	// plain strings; the scraper never writes NULLs, but hand-maintained rows
+	// can have them.
 	query := `
 		SELECT DISTINCT sa.slug, sa.name, sa.mso_url, sa.road, sa.direction,
-		       sa.location_raw, sa.postcode, sa.address, COALESCE(sa.latitude, 0), COALESCE(sa.longitude, 0), sa.operator, sa.mso_rating,
-		       sa.last_scraped_at::text,
+		       COALESCE(sa.location_raw, ''), COALESCE(sa.postcode, ''), COALESCE(sa.address, ''),
+		       COALESCE(sa.latitude, 0), COALESCE(sa.longitude, 0), COALESCE(sa.operator, ''), sa.mso_rating,
+		       COALESCE(sa.last_scraped_at::text, ''),
 		       f.catering_brands, f.fuel_brands, f.forecourt_shops, f.hotels,
 		       f.has_showers, f.has_atm, f.has_play_area, f.has_lpg, f.hgv_access,
-		       f.ev_charging, f.ev_charger_info, f.outdoor_space, f.outdoor_space_info,
+		       f.ev_charging, COALESCE(f.ev_charger_info, ''), f.outdoor_space,
+		       COALESCE(f.outdoor_space_info, ''),
 		       f.dog_friendly
 		FROM service_areas sa
 		JOIN facilities f ON f.service_area_id = sa.id

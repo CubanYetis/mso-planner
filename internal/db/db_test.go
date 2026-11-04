@@ -58,3 +58,50 @@ func TestGeocodeCache(t *testing.T) {
 		t.Errorf("overwrite: got (%v, %v), want (1, 2)", lat, lon)
 	}
 }
+
+// TestListServicesNullColumns is a regression test: rows with NULLs in the
+// optional text columns (possible via hand-maintained data; the scraper
+// writes "") must not break ListServices.
+func TestListServicesNullColumns(t *testing.T) {
+	p := testPool(t)
+	ctx := context.Background()
+	slug := fmt.Sprintf("null-columns-%d", time.Now().UnixNano())
+
+	var id int64
+	err := p.pool.QueryRow(ctx, `
+		INSERT INTO service_areas (slug, name, mso_url, road, direction, location_raw, postcode, address, operator, last_scraped_at)
+		VALUES ($1, 'Null Test', 'https://example.com/'||$1, 'M1', 'both', NULL, NULL, NULL, NULL, NULL)
+		RETURNING id
+	`, slug).Scan(&id)
+	if err != nil {
+		t.Fatalf("inserting service: %v", err)
+	}
+	if _, err := p.pool.Exec(ctx, `
+		INSERT INTO facilities (service_area_id, ev_charger_info, outdoor_space_info)
+		VALUES ($1, NULL, NULL)
+	`, id); err != nil {
+		t.Fatalf("inserting facilities: %v", err)
+	}
+	if _, err := p.pool.Exec(ctx, `
+		INSERT INTO service_roads (service_area_id, road) VALUES ($1, 'M1')
+	`, id); err != nil {
+		t.Fatalf("inserting service_roads: %v", err)
+	}
+	t.Cleanup(func() {
+		p.pool.Exec(ctx, `DELETE FROM service_areas WHERE id = $1`, id)
+	})
+
+	services, err := p.ListServices(ctx, ListServicesOptions{Road: "M1"})
+	if err != nil {
+		t.Fatalf("ListServices with NULL columns: %v", err)
+	}
+	found := false
+	for _, sa := range services {
+		if sa.Slug == slug {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("inserted service not returned by ListServices")
+	}
+}
