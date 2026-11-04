@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -49,6 +50,18 @@ type dashboardFilters struct {
 
 type routePoint = geo.Point
 
+// routeService is a ServiceArea plus where it falls on the planned route,
+// so the template can show stops in journey order. AlongMeters is 0 when no
+// route was planned.
+type routeService struct {
+	models.ServiceArea
+	AlongMeters float64
+}
+
+func (s routeService) AlongKM() float64 {
+	return s.AlongMeters / 1000
+}
+
 type routeData struct {
 	Start       string
 	End         string
@@ -69,7 +82,7 @@ type dashboardData struct {
 	WithFuel        int
 	WithEV          int
 	Filters         dashboardFilters
-	Services        []models.ServiceArea
+	Services        []routeService
 	Error           string
 	Route           routeData
 	RouteGeometryJS template.JS
@@ -134,7 +147,7 @@ func makeHandler(pool *db.Pool, gc *geo.Geocoder, rt *geo.Router) http.HandlerFu
 			}
 		}
 
-		services, err := pool.ListServices(ctx, db.ListServicesOptions{
+		listed, err := pool.ListServices(ctx, db.ListServicesOptions{
 			Road:     filters.Road,
 			Roads:    route.Roads,
 			Operator: filters.Operator,
@@ -147,15 +160,18 @@ func makeHandler(pool *db.Pool, gc *geo.Geocoder, rt *geo.Router) http.HandlerFu
 			return
 		}
 
+		var services []routeService
 		if len(route.Geometry) > 0 {
-			filtered, err := filterServicesByRoute(ctx, pool, gc, services, route)
+			services, err = filterServicesByRoute(ctx, pool, gc, listed, route)
 			if err != nil {
 				renderTemplate(w, dashboardData{Error: fmt.Sprintf("could not filter services by route: %v", err)})
 				return
 			}
-			if len(filtered) > 0 {
-				services = filtered
+			if len(services) == 0 {
+				services = wrapServices(listed)
 			}
+		} else {
+			services = wrapServices(listed)
 		}
 
 		routeJSON := template.JS("null")
@@ -275,9 +291,9 @@ func normalizeRoadName(name string) string {
 const routeMatchDistanceMeters = 5000
 const earthRadiusMeters = 6371000.0
 
-// filterServicesByRoute returns services within the configured distance of a route.
-func filterServicesByRoute(ctx context.Context, pool *db.Pool, gc *geo.Geocoder, services []models.ServiceArea, route routeData) ([]models.ServiceArea, error) {
-	var out []models.ServiceArea
+// filterServicesByRoute fills in missing coordinates, then keeps only the
+// services near the route, in journey order.
+func filterServicesByRoute(ctx context.Context, pool *db.Pool, gc *geo.Geocoder, services []models.ServiceArea, route routeData) ([]routeService, error) {
 	for i := range services {
 		sa := &services[i]
 		if sa.Latitude == 0 && sa.Longitude == 0 && sa.Postcode != "" {
@@ -285,16 +301,35 @@ func filterServicesByRoute(ctx context.Context, pool *db.Pool, gc *geo.Geocoder,
 				log.Printf("warning: could not geocode %s: %v", sa.Slug, err)
 			}
 		}
+	}
+	return servicesNearRoute(services, route.Geometry), nil
+}
 
+// servicesNearRoute returns the services within the matching distance of the
+// route, ordered by how far along the route their closest point falls.
+// Services without coordinates can't be placed and are dropped.
+func servicesNearRoute(services []models.ServiceArea, geometry []routePoint) []routeService {
+	var out []routeService
+	for _, sa := range services {
 		if sa.Latitude == 0 && sa.Longitude == 0 {
 			continue
 		}
-
-		if m, ok := nearestOnRoute(sa.Latitude, sa.Longitude, route.Geometry); ok && m.distMeters <= routeMatchDistanceMeters {
-			out = append(out, *sa)
+		m, ok := nearestOnRoute(sa.Latitude, sa.Longitude, geometry)
+		if !ok || m.distMeters > routeMatchDistanceMeters {
+			continue
 		}
+		out = append(out, routeService{ServiceArea: sa, AlongMeters: m.alongMeters})
 	}
-	return out, nil
+	sort.SliceStable(out, func(i, j int) bool { return out[i].AlongMeters < out[j].AlongMeters })
+	return out
+}
+
+func wrapServices(services []models.ServiceArea) []routeService {
+	out := make([]routeService, len(services))
+	for i, sa := range services {
+		out[i] = routeService{ServiceArea: sa}
+	}
+	return out
 }
 
 // maybeGeocodeServiceCoordinates fills and persists coordinates for a service.
