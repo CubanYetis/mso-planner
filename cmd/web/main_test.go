@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/BigRedS/mso-planner/internal/geo"
+	"github.com/BigRedS/mso-planner/internal/models"
 )
 
 func TestNormalizeRoadName(t *testing.T) {
@@ -153,6 +154,28 @@ func TestNearestOnRoute(t *testing.T) {
 	// The winning segment runs due north.
 	if math.Abs(m.bearing-0) > 1 && math.Abs(m.bearing-360) > 1 {
 		t.Errorf("bearing = %.1f, want ~0", m.bearing)
+	}
+}
+
+// TestServicesNearRoute uses a due-west-to-east route along latitude 52 and
+// expects services in that journey order regardless of input order.
+func TestServicesNearRoute(t *testing.T) {
+	route := []routePoint{{Lat: 52, Lon: -1}, {Lat: 52, Lon: 0}}
+	services := []models.ServiceArea{
+		{Slug: "last", Latitude: 52.01, Longitude: -0.2},
+		{Slug: "too-far", Latitude: 53, Longitude: -0.5},
+		{Slug: "no-coords", Longitude: -0.4},
+		{Slug: "first", Latitude: 52.01, Longitude: -0.8},
+		{Slug: "middle", Latitude: 52.01, Longitude: -0.5},
+	}
+	got := servicesNearRoute(services, route)
+	var order []string
+	for _, s := range got {
+		order = append(order, s.Slug)
+	}
+	want := []string{"first", "middle", "last"}
+	if !reflect.DeepEqual(order, want) {
+		t.Errorf("order = %v, want %v", order, want)
 	}
 }
 
