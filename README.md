@@ -131,7 +131,7 @@ come from a Kubernetes Secret and are never committed.
 ## Next steps
 
 - [x] OSRM integration (route geometry → nearby services, basic version)
-- [ ] Tests for the pure parsing/geometry functions
+- [x] Tests for the pure parsing/geometry functions
 - [ ] Add PostGIS for spatial queries (currently filtered in Go)
 - [x] Stop geocoding in the web request path (scrape-time + `geocode-backfill` instead)
 - [ ] Use a self-hosted OSRM/Nominatim instead of the public services
