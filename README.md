@@ -26,7 +26,8 @@ mso-planner/
 ```
 
 The web UI geocodes start/end with Nominatim, routes with the public OSRM demo
-server, then lists services within 5 km of the route.
+server, then lists services within 5 km of the route that serve the direction
+of travel, ordered by position along the route.
 
 Production runs on Kubernetes against an external Postgres. Manifests for the
 web Deployment and a scraper CronJob (each needing only an `MSO_DB_DSN` Secret)
