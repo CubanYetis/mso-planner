@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -49,6 +50,18 @@ type dashboardFilters struct {
 
 type routePoint = geo.Point
 
+// routeService is a ServiceArea plus where it falls on the planned route,
+// so the template can show stops in journey order. AlongMeters is 0 when no
+// route was planned.
+type routeService struct {
+	models.ServiceArea
+	AlongMeters float64
+}
+
+func (s routeService) AlongKM() float64 {
+	return s.AlongMeters / 1000
+}
+
 type routeData struct {
 	Start       string
 	End         string
@@ -69,7 +82,7 @@ type dashboardData struct {
 	WithFuel        int
 	WithEV          int
 	Filters         dashboardFilters
-	Services        []models.ServiceArea
+	Services        []routeService
 	Error           string
 	Route           routeData
 	RouteGeometryJS template.JS
@@ -134,7 +147,7 @@ func makeHandler(pool *db.Pool, gc *geo.Geocoder, rt *geo.Router) http.HandlerFu
 			}
 		}
 
-		services, err := pool.ListServices(ctx, db.ListServicesOptions{
+		listed, err := pool.ListServices(ctx, db.ListServicesOptions{
 			Road:     filters.Road,
 			Roads:    route.Roads,
 			Operator: filters.Operator,
@@ -147,15 +160,14 @@ func makeHandler(pool *db.Pool, gc *geo.Geocoder, rt *geo.Router) http.HandlerFu
 			return
 		}
 
+		services := wrapServices(listed)
 		if len(route.Geometry) > 0 {
-			filtered, err := filterServicesByRoute(ctx, pool, gc, services, route)
-			if err != nil {
-				renderTemplate(w, dashboardData{Error: fmt.Sprintf("could not filter services by route: %v", err)})
-				return
-			}
-			if len(filtered) > 0 {
-				services = filtered
-			}
+			// With a route planned, only the honest answer will do: if nothing
+			// matches, the table is empty rather than silently reverting to
+			// the unfiltered road list. Services are matched on coordinates
+			// captured at scrape time — none are geocoded here, while a user
+			// waits; services without coordinates simply don't appear.
+			services = servicesNearRoute(listed, route.Geometry)
 		}
 
 		routeJSON := template.JS("null")
@@ -275,56 +287,101 @@ func normalizeRoadName(name string) string {
 const routeMatchDistanceMeters = 5000
 const earthRadiusMeters = 6371000.0
 
-// filterServicesByRoute returns services within the configured distance of a route.
-func filterServicesByRoute(ctx context.Context, pool *db.Pool, gc *geo.Geocoder, services []models.ServiceArea, route routeData) ([]models.ServiceArea, error) {
-	var out []models.ServiceArea
-	for i := range services {
-		sa := &services[i]
-		if sa.Latitude == 0 && sa.Longitude == 0 && sa.Postcode != "" {
-			if err := maybeGeocodeServiceCoordinates(ctx, pool, gc, sa); err != nil {
-				log.Printf("warning: could not geocode %s: %v", sa.Slug, err)
-			}
-		}
-
+// servicesNearRoute returns the services within the matching distance of the
+// route that serve the direction of travel, ordered by how far along the
+// route their closest point falls. Services without coordinates can't be
+// placed and are dropped.
+func servicesNearRoute(services []models.ServiceArea, geometry []routePoint) []routeService {
+	var out []routeService
+	for _, sa := range services {
 		if sa.Latitude == 0 && sa.Longitude == 0 {
 			continue
 		}
-
-		if pointToRouteDistance(sa.Latitude, sa.Longitude, route.Geometry) <= routeMatchDistanceMeters {
-			out = append(out, *sa)
+		m, ok := nearestOnRoute(sa.Latitude, sa.Longitude, geometry)
+		if !ok || m.distMeters > routeMatchDistanceMeters {
+			continue
 		}
+		if !directionMatchesBearing(sa.Direction, m.bearing) {
+			continue
+		}
+		out = append(out, routeService{ServiceArea: sa, AlongMeters: m.alongMeters})
 	}
-	return out, nil
+	sort.SliceStable(out, func(i, j int) bool { return out[i].AlongMeters < out[j].AlongMeters })
+	return out
 }
 
-// maybeGeocodeServiceCoordinates fills and persists coordinates for a service.
-func maybeGeocodeServiceCoordinates(ctx context.Context, pool *db.Pool, gc *geo.Geocoder, sa *models.ServiceArea) error {
-	lat, lon, err := gc.Geocode(ctx, sa.Postcode)
-	if err != nil {
-		return err
+// directionConeHalfAngleDegrees is how far the route's heading may drift from
+// a service's signed direction before we decide it serves the other
+// carriageway. Motorways bend, so the cones are wide.
+const directionConeHalfAngleDegrees = 45.0
+
+// directionMatchesBearing reports whether a service signed for direction is
+// useful when travelling on the given bearing. "both" (online and junction
+// services) always matches, as do clockwise/anticlockwise: deciding those
+// needs the ring road's centre and there are few of them, so they stay
+// unfiltered for now.
+func directionMatchesBearing(direction string, bearing float64) bool {
+	var want float64
+	switch direction {
+	case "northbound":
+		want = 0
+	case "eastbound":
+		want = 90
+	case "southbound":
+		want = 180
+	case "westbound":
+		want = 270
+	default:
+		return true
 	}
-	sa.Latitude = lat
-	sa.Longitude = lon
-	return pool.UpdateServiceCoordinates(ctx, sa.Slug, lat, lon)
+	diff := math.Abs(math.Mod(bearing-want+540, 360) - 180)
+	return diff <= directionConeHalfAngleDegrees
 }
 
-func pointToRouteDistance(lat, lon float64, geometry []routePoint) float64 {
-	if len(geometry) == 0 {
-		return math.MaxFloat64
+func wrapServices(services []models.ServiceArea) []routeService {
+	out := make([]routeService, len(services))
+	for i, sa := range services {
+		out[i] = routeService{ServiceArea: sa}
 	}
-	minDist := math.MaxFloat64
+	return out
+}
+
+// routeMatch describes a point's relationship to a route: how far off the
+// route it is, where along the route its closest point sits, and which way
+// the route heads there.
+type routeMatch struct {
+	distMeters  float64
+	alongMeters float64 // arc length from the route's start to the closest point
+	bearing     float64 // compass heading of the winning segment, degrees
+}
+
+// nearestOnRoute finds the closest point on geometry to (lat, lon). ok is
+// false when the route has no segments to measure against.
+func nearestOnRoute(lat, lon float64, geometry []routePoint) (m routeMatch, ok bool) {
+	if len(geometry) < 2 {
+		return routeMatch{}, false
+	}
+	m.distMeters = math.MaxFloat64
+	var cum float64
 	for i := 0; i < len(geometry)-1; i++ {
-		d := distancePointToSegmentMeters(lat, lon, geometry[i], geometry[i+1])
-		if d < minDist {
-			minDist = d
+		segLen := haversineMeters(geometry[i].Lat, geometry[i].Lon, geometry[i+1].Lat, geometry[i+1].Lon)
+		d, t := distancePointToSegmentMeters(lat, lon, geometry[i], geometry[i+1])
+		if d < m.distMeters {
+			m.distMeters = d
+			m.alongMeters = cum + t*segLen
+			m.bearing = bearingDegrees(geometry[i], geometry[i+1])
 		}
+		cum += segLen
 	}
-	return minDist
+	return m, true
 }
 
-func distancePointToSegmentMeters(lat, lon float64, a, b routePoint) float64 {
+// distancePointToSegmentMeters returns the distance from (lat, lon) to segment
+// a-b and the clamped projection parameter t: 0 means the closest point is a,
+// 1 means b, and values in between are that fraction along the segment.
+func distancePointToSegmentMeters(lat, lon float64, a, b routePoint) (dist float64, t float64) {
 	if a.Lat == b.Lat && a.Lon == b.Lon {
-		return haversineMeters(lat, lon, a.Lat, a.Lon)
+		return haversineMeters(lat, lon, a.Lat, a.Lon), 0
 	}
 
 	latR := degreesToRadians(lat)
@@ -342,17 +399,27 @@ func distancePointToSegmentMeters(lat, lon float64, a, b routePoint) float64 {
 
 	dx := x2 - x1
 	dy := y2 - y1
-	t := -(x1*dx + y1*dy) / (dx*dx + dy*dy)
+	t = -(x1*dx + y1*dy) / (dx*dx + dy*dy)
 	if t < 0 {
-		return haversineMeters(lat, lon, a.Lat, a.Lon)
+		return haversineMeters(lat, lon, a.Lat, a.Lon), 0
 	}
 	if t > 1 {
-		return haversineMeters(lat, lon, b.Lat, b.Lon)
+		return haversineMeters(lat, lon, b.Lat, b.Lon), 1
 	}
 
 	x := x1 + t*dx
 	y := y1 + t*dy
-	return math.Sqrt(x*x+y*y) * earthRadiusMeters
+	return math.Sqrt(x*x+y*y) * earthRadiusMeters, t
+}
+
+// bearingDegrees returns the initial compass bearing from a to b, clockwise
+// from north.
+func bearingDegrees(a, b routePoint) float64 {
+	lat1, lat2 := degreesToRadians(a.Lat), degreesToRadians(b.Lat)
+	dLon := degreesToRadians(b.Lon - a.Lon)
+	y := math.Sin(dLon) * math.Cos(lat2)
+	x := math.Cos(lat1)*math.Sin(lat2) - math.Sin(lat1)*math.Cos(lat2)*math.Cos(dLon)
+	return math.Mod(math.Atan2(y, x)*180/math.Pi+360, 360)
 }
 
 func haversineMeters(lat1, lon1, lat2, lon2 float64) float64 {

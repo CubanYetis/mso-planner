@@ -223,6 +223,32 @@ func (p *Pool) UpdateServiceCoordinates(ctx context.Context, slug string, lat, l
 	return err
 }
 
+// ListServicesMissingCoordinates returns services with no usable coordinates
+// (never geocoded, or geocoding failed at scrape time), for the backfill
+// command. Only the fields geocoding needs are populated.
+func (p *Pool) ListServicesMissingCoordinates(ctx context.Context) ([]models.ServiceArea, error) {
+	rows, err := p.pool.Query(ctx, `
+		SELECT slug, COALESCE(postcode, ''), COALESCE(address, '')
+		FROM service_areas
+		WHERE COALESCE(latitude, 0) = 0 AND COALESCE(longitude, 0) = 0
+		ORDER BY slug
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []models.ServiceArea
+	for rows.Next() {
+		var sa models.ServiceArea
+		if err := rows.Scan(&sa.Slug, &sa.Postcode, &sa.Address); err != nil {
+			return nil, err
+		}
+		out = append(out, sa)
+	}
+	return out, rows.Err()
+}
+
 // GetGeocode returns a cached geocoding result. ok is false on a cache miss.
 func (p *Pool) GetGeocode(ctx context.Context, query string) (lat, lon float64, ok bool, err error) {
 	err = p.pool.QueryRow(ctx,
@@ -313,13 +339,18 @@ type ListServicesOptions struct {
 }
 
 func (p *Pool) ListServices(ctx context.Context, opts ListServicesOptions) ([]models.ServiceArea, error) {
+	// Nullable text columns are COALESCEd to "" because the scan targets are
+	// plain strings; the scraper never writes NULLs, but hand-maintained rows
+	// can have them.
 	query := `
 		SELECT DISTINCT sa.slug, sa.name, sa.mso_url, sa.road, sa.direction,
-		       sa.location_raw, sa.postcode, sa.address, COALESCE(sa.latitude, 0), COALESCE(sa.longitude, 0), sa.operator, sa.mso_rating,
-		       sa.last_scraped_at::text,
+		       COALESCE(sa.location_raw, ''), COALESCE(sa.postcode, ''), COALESCE(sa.address, ''),
+		       COALESCE(sa.latitude, 0), COALESCE(sa.longitude, 0), COALESCE(sa.operator, ''), sa.mso_rating,
+		       COALESCE(sa.last_scraped_at::text, ''),
 		       f.catering_brands, f.fuel_brands, f.forecourt_shops, f.hotels,
 		       f.has_showers, f.has_atm, f.has_play_area, f.has_lpg, f.hgv_access,
-		       f.ev_charging, f.ev_charger_info, f.outdoor_space, f.outdoor_space_info,
+		       f.ev_charging, COALESCE(f.ev_charger_info, ''), f.outdoor_space,
+		       COALESCE(f.outdoor_space_info, ''),
 		       f.dog_friendly
 		FROM service_areas sa
 		JOIN facilities f ON f.service_area_id = sa.id

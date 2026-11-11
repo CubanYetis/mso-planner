@@ -120,6 +120,7 @@
           <tr>
             <th>Name</th>
             <th>Road</th>
+            {{if $.Route.Geometry}}<th>Along route</th>{{end}}
             <th>Operator</th>
             <th>Rating</th>
             <th>Fuel</th>
@@ -133,6 +134,7 @@
           <tr>
             <td><a href="{{.MSOURL}}" target="_blank" rel="noreferrer noopener">{{.Name}}</a></td>
             <td>{{.Road}}</td>
+            {{if $.Route.Geometry}}<td>{{printf "%.0f km" .AlongKM}}</td>{{end}}
             <td>{{.Operator}}</td>
             <td>{{printf "%.1f" .MSOrating}}</td>
             <td>{{if .Facilities.FuelBrands}}{{join .Facilities.FuelBrands ", "}}{{else}}—{{end}}</td>
