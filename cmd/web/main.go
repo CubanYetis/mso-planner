@@ -60,7 +60,7 @@ type dashboardData struct {
 	WithFuel        int
 	WithEV          int
 	Filters         dashboardFilters
-	Prefs           planner.Preferences
+	PrefControls    []prefControl
 	Services        []planner.RouteService
 	Error           string
 	Route           routeData
@@ -131,8 +131,10 @@ func makeHandler(pool *db.Pool, gc *geo.Geocoder, rt *geo.Router) http.HandlerFu
 			Road:     filters.Road,
 			Roads:    route.Roads,
 			Operator: filters.Operator,
-			WithFuel: prefs.RequireFuel,
-			WithEV:   prefs.RequireEV,
+			// planner.Filter below is what decides; this only stops the SQL
+			// LIMIT being spent on services that would be filtered out anyway.
+			WithFuel: prefs.Fuel == planner.Require,
+			WithEV:   prefs.EV == planner.Require,
 			Limit:    filters.Limit,
 		})
 		if err != nil {
@@ -149,6 +151,10 @@ func makeHandler(pool *db.Pool, gc *geo.Geocoder, rt *geo.Router) http.HandlerFu
 			// waits; services without coordinates simply don't appear.
 			services = planner.ServicesNearRoute(listed, route.Geometry)
 		}
+		services = planner.Filter(services, prefs)
+		if len(route.Geometry) > 0 {
+			services = planner.Rank(services, prefs)
+		}
 
 		routeJSON := template.JS("null")
 		if len(route.Geometry) > 0 {
@@ -163,7 +169,7 @@ func makeHandler(pool *db.Pool, gc *geo.Geocoder, rt *geo.Router) http.HandlerFu
 			WithFuel:        withFuel,
 			WithEV:          withEV,
 			Filters:         filters,
-			Prefs:           prefs,
+			PrefControls:    prefControls(prefs),
 			Services:        services,
 			Route:           route,
 			RouteGeometryJS: routeJSON,
@@ -190,19 +196,43 @@ func parseFilters(r *http.Request) dashboardFilters {
 	}
 }
 
-// parsePreferences reads the traveller's preferences from the search form.
-// Checkboxes arrive as "on" from the form; "1" is accepted for hand-written
-// URLs. Anything else, or absence, means off.
-func parsePreferences(query url.Values) planner.Preferences {
-	return planner.Preferences{
-		RequireFuel: checked(query, "fuel"),
-		RequireEV:   checked(query, "ev"),
+// prefControl is one facility's don't care/prefer/require select on the
+// search form.
+type prefControl struct {
+	Name  string // query parameter, as read by parsePreferences
+	Label string
+	Value planner.Want
+}
+
+func prefControls(p planner.Preferences) []prefControl {
+	return []prefControl{
+		{"fuel", "Fuel", p.Fuel},
+		{"ev", "EV charging", p.EV},
+		{"dog", "Dog walk", p.DogWalk},
 	}
 }
 
-func checked(query url.Values, name string) bool {
-	v := query.Get(name)
-	return v == "on" || v == "1"
+// parsePreferences reads the traveller's preferences from the search form:
+// "prefer" or "require" per facility, anything else meaning don't care.
+// "on" and "1" mean require, so links from when these were checkboxes still
+// work.
+func parsePreferences(query url.Values) planner.Preferences {
+	return planner.Preferences{
+		Fuel:    parseWant(query.Get("fuel")),
+		EV:      parseWant(query.Get("ev")),
+		DogWalk: parseWant(query.Get("dog")),
+	}
+}
+
+func parseWant(v string) planner.Want {
+	switch v {
+	case "prefer":
+		return planner.Prefer
+	case "require", "on", "1":
+		return planner.Require
+	default:
+		return planner.DontCare
+	}
 }
 
 // planRoute geocodes the endpoints and requests a driving route between them.
