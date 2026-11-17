@@ -62,13 +62,13 @@
           </div>
           <div>
             <label>
-              <input type="checkbox" name="fuel" {{if .Filters.WithFuel}}checked{{end}}>
+              <input type="checkbox" name="fuel" {{if .Prefs.RequireFuel}}checked{{end}}>
               With fuel
             </label>
           </div>
           <div>
             <label>
-              <input type="checkbox" name="ev" {{if .Filters.WithEV}}checked{{end}}>
+              <input type="checkbox" name="ev" {{if .Prefs.RequireEV}}checked{{end}}>
               With EV charging
             </label>
           </div>

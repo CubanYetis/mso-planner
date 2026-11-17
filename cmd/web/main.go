@@ -8,6 +8,7 @@ import (
 	"html/template"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -34,8 +35,6 @@ var templates = template.Must(template.New("dashboard").Funcs(template.FuncMap{
 type dashboardFilters struct {
 	Road     string
 	Operator string
-	WithFuel bool
-	WithEV   bool
 	Start    string
 	End      string
 	Limit    int
@@ -61,6 +60,7 @@ type dashboardData struct {
 	WithFuel        int
 	WithEV          int
 	Filters         dashboardFilters
+	Prefs           planner.Preferences
 	Services        []planner.RouteService
 	Error           string
 	Route           routeData
@@ -109,6 +109,7 @@ func main() {
 func makeHandler(pool *db.Pool, gc *geo.Geocoder, rt *geo.Router) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		filters := parseFilters(r)
+		prefs := parsePreferences(r.URL.Query())
 		ctx := r.Context()
 
 		total, withFuel, withEV, err := pool.Stats(ctx)
@@ -130,8 +131,8 @@ func makeHandler(pool *db.Pool, gc *geo.Geocoder, rt *geo.Router) http.HandlerFu
 			Road:     filters.Road,
 			Roads:    route.Roads,
 			Operator: filters.Operator,
-			WithFuel: filters.WithFuel,
-			WithEV:   filters.WithEV,
+			WithFuel: prefs.RequireFuel,
+			WithEV:   prefs.RequireEV,
 			Limit:    filters.Limit,
 		})
 		if err != nil {
@@ -162,6 +163,7 @@ func makeHandler(pool *db.Pool, gc *geo.Geocoder, rt *geo.Router) http.HandlerFu
 			WithFuel:        withFuel,
 			WithEV:          withEV,
 			Filters:         filters,
+			Prefs:           prefs,
 			Services:        services,
 			Route:           route,
 			RouteGeometryJS: routeJSON,
@@ -182,12 +184,25 @@ func parseFilters(r *http.Request) dashboardFilters {
 	return dashboardFilters{
 		Road:     strings.ToUpper(strings.TrimSpace(query.Get("road"))),
 		Operator: strings.TrimSpace(query.Get("operator")),
-		WithFuel: query.Get("fuel") == "on" || query.Get("fuel") == "1",
-		WithEV:   query.Get("ev") == "on" || query.Get("ev") == "1",
 		Start:    strings.TrimSpace(query.Get("start")),
 		End:      strings.TrimSpace(query.Get("end")),
 		Limit:    limit,
 	}
+}
+
+// parsePreferences reads the traveller's preferences from the search form.
+// Checkboxes arrive as "on" from the form; "1" is accepted for hand-written
+// URLs. Anything else, or absence, means off.
+func parsePreferences(query url.Values) planner.Preferences {
+	return planner.Preferences{
+		RequireFuel: checked(query, "fuel"),
+		RequireEV:   checked(query, "ev"),
+	}
+}
+
+func checked(query url.Values, name string) bool {
+	v := query.Get(name)
+	return v == "on" || v == "1"
 }
 
 // planRoute geocodes the endpoints and requests a driving route between them.
