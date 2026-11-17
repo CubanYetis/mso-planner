@@ -159,33 +159,14 @@ func TestListServicesMissingCoordinates(t *testing.T) {
 // The race only happens when the tables don't exist yet, so each run migrates
 // into a fresh, empty schema (via search_path) rather than the shared one.
 func TestMigrateConcurrent(t *testing.T) {
-	dsn := os.Getenv("MSO_TEST_DSN")
-	if dsn == "" {
-		t.Skip("MSO_TEST_DSN not set")
-	}
 	ctx := context.Background()
-	admin := testPool(t)
-	schemaName := fmt.Sprintf("migrate_test_%d", time.Now().UnixNano())
-	if _, err := admin.pool.Exec(ctx, "CREATE SCHEMA "+schemaName); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		admin.pool.Exec(ctx, "DROP SCHEMA "+schemaName+" CASCADE")
-	})
-
-	u, err := url.Parse(dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	q := u.Query()
-	q.Set("search_path", schemaName)
-	u.RawQuery = q.Encode()
+	dsn := freshSchemaDSN(t)
 
 	// One pool per goroutine, standing in for separate processes.
 	const n = 8
 	pools := make([]*Pool, n)
 	for i := range pools {
-		p, err := Connect(ctx, u.String())
+		p, err := Connect(ctx, dsn)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -209,4 +190,90 @@ func TestMigrateConcurrent(t *testing.T) {
 			t.Errorf("concurrent Migrate: %v", err)
 		}
 	}
+}
+
+// TestMigrateWhileWriting is a regression test: Migrate against an existing
+// schema while another session inserts into service_roads used to deadlock.
+// ALTER TABLE ... ADD COLUMN IF NOT EXISTS takes an AccessExclusive lock on
+// service_areas even when the column exists, and with the whole schema in one
+// transaction Migrate then held it while waiting to lock service_roads; the
+// insert holds service_roads and waits on service_areas for its foreign-key
+// check. That's the web pod restarting mid-scrape, or test packages run in
+// parallel.
+func TestMigrateWhileWriting(t *testing.T) {
+	ctx := context.Background()
+	dsn := freshSchemaDSN(t)
+	migrator, err := Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(migrator.Close)
+	writer, err := Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(writer.Close)
+	if err := migrator.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	var id int64
+	if err := writer.pool.QueryRow(ctx, `
+		INSERT INTO service_areas (slug, name, mso_url, road) VALUES ('w', 'w', 'w', 'M1') RETURNING id
+	`).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+
+	// Race the two for a while; the deadlock needs an unlucky interleaving.
+	deadline := time.Now().Add(3 * time.Second)
+	writeErr := make(chan error, 1)
+	go func() {
+		for i := 0; time.Now().Before(deadline); i++ {
+			if _, err := writer.pool.Exec(ctx,
+				`INSERT INTO service_roads (service_area_id, road) VALUES ($1, $2)`,
+				id, fmt.Sprintf("R%d", i)); err != nil {
+				writeErr <- err
+				return
+			}
+		}
+		writeErr <- nil
+	}()
+	for time.Now().Before(deadline) {
+		if err := migrator.Migrate(ctx); err != nil {
+			t.Errorf("Migrate while writing: %v", err)
+			break
+		}
+	}
+	if err := <-writeErr; err != nil {
+		t.Errorf("insert while migrating: %v", err)
+	}
+}
+
+// freshSchemaDSN creates an empty schema, dropped when the test ends, and
+// returns MSO_TEST_DSN pointed at it via search_path. For tests whose race
+// needs tables that are missing, or that nothing else is using.
+func freshSchemaDSN(t *testing.T) string {
+	t.Helper()
+	dsn := os.Getenv("MSO_TEST_DSN")
+	if dsn == "" {
+		t.Skip("MSO_TEST_DSN not set")
+	}
+	ctx := context.Background()
+	admin := testPool(t)
+	schemaName := fmt.Sprintf("migrate_test_%d", time.Now().UnixNano())
+	if _, err := admin.pool.Exec(ctx, "CREATE SCHEMA "+schemaName); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		admin.pool.Exec(ctx, "DROP SCHEMA "+schemaName+" CASCADE")
+	})
+
+	u, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := u.Query()
+	q.Set("search_path", schemaName)
+	u.RawQuery = q.Encode()
+	return u.String()
 }
