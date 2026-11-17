@@ -36,12 +36,38 @@ func (p *Pool) Close() {
 	p.pool.Close()
 }
 
+// migrateLockKey is an arbitrary constant identifying our schema migration
+// to pg_advisory_xact_lock. Any int64 works so long as nothing else in the
+// database uses the same key for a different purpose.
+const migrateLockKey = 7346_1001
+
 // Migrate creates the schema if it doesn't exist.
 // We keep migrations inline here for simplicity; for a real project
 // you'd use golang-migrate or similar.
+//
+// CREATE TABLE IF NOT EXISTS is not safe against another session creating
+// the same table at the same moment: one of them fails with a duplicate-key
+// error on Postgres's catalog. That happens when web and scraper start
+// together against an empty database, or test packages run in parallel. So
+// the whole schema is applied inside one transaction holding an advisory
+// lock; concurrent callers queue on the lock, and by the time each gets it
+// the tables exist and every statement is a no-op. The lock is released
+// automatically at commit or rollback.
 func (p *Pool) Migrate(ctx context.Context) error {
-	_, err := p.pool.Exec(ctx, schema)
-	return err
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("beginning migration: %w", err)
+	}
+	// Rollback after a successful Commit is a harmless no-op.
+	defer tx.Rollback(ctx)
+
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", migrateLockKey); err != nil {
+		return fmt.Errorf("taking migration lock: %w", err)
+	}
+	if _, err := tx.Exec(ctx, schema); err != nil {
+		return fmt.Errorf("applying schema: %w", err)
+	}
+	return tx.Commit(ctx)
 }
 
 const schema = `
