@@ -1,0 +1,42 @@
+# Weekly full scrape. MSO changes slowly, and the scraper is deliberately
+# slow (2-4 hours) to be polite to it; more often would just be impolite.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: scraper
+spec:
+  schedule: "0 3 * * 1"
+  timeZone: Europe/London
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # Comfortably over a normal run; stops a wedged scrape running into
+      # next week's.
+      activeDeadlineSeconds: 28800  # 8h
+      # No retries: a failed run re-scraping from the top straight away is
+      # hours of extra load on MSO. Next week's run (or a manual one) will do.
+      backoffLimit: 0
+      template:
+        spec:
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+          containers:
+            - name: scraper
+              image: ghcr.io/bigreds/mso-planner-scraper
+              imagePullPolicy: Always
+              envFrom:
+                - secretRef:
+                    name: mso-planner-secret
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: [ALL]
