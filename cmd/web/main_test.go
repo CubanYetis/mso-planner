@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"io"
 	"net/url"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -36,9 +37,10 @@ func TestParsePreferences(t *testing.T) {
 		want  planner.Preferences
 	}{
 		{"nothing set", "", planner.Preferences{}},
-		{"form checkboxes", "fuel=on&ev=on", planner.Preferences{RequireFuel: true, RequireEV: true}},
-		{"hand-written URL", "fuel=1", planner.Preferences{RequireFuel: true}},
-		{"other values are off", "fuel=yes&ev=0", planner.Preferences{}},
+		{"form selects", "fuel=require&ev=prefer&dog=any", planner.Preferences{Fuel: planner.Require, EV: planner.Prefer}},
+		{"dog walk", "dog=prefer", planner.Preferences{DogWalk: planner.Prefer}},
+		{"old checkbox links mean require", "fuel=on&ev=1", planner.Preferences{Fuel: planner.Require, EV: planner.Require}},
+		{"other values mean don't care", "fuel=yes&ev=0&dog=REQUIRE", planner.Preferences{}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -57,15 +59,44 @@ func TestParsePreferences(t *testing.T) {
 // preferences that produced the results, so a second search keeps them.
 func TestTemplateKeepsPreferences(t *testing.T) {
 	var buf bytes.Buffer
-	data := dashboardData{Prefs: planner.Preferences{RequireEV: true}}
+	prefs := planner.Preferences{EV: planner.Require, DogWalk: planner.Prefer}
+	if err := templates.ExecuteTemplate(&buf, "index.html", dashboardData{PrefControls: prefControls(prefs)}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Round trip: read back which option each select has selected, and
+	// parse that as if the form were submitted.
+	selected := regexp.MustCompile(`(?s)<select id="pref-\w+" name="(\w+)">.*?(?:<option value="(\w+)" selected>|</select>)`)
+	q := url.Values{}
+	for _, m := range selected.FindAllStringSubmatch(buf.String(), -1) {
+		if m[2] != "" {
+			q.Set(m[1], m[2])
+		}
+	}
+	if got := parsePreferences(q); got != prefs {
+		t.Errorf("form re-submits as %+v, want %+v (selected: %v)", got, prefs, q)
+	}
+}
+
+// TestTemplateShowsRankAndReasons checks the route table shows each
+// stop's rank and its badges.
+func TestTemplateShowsRankAndReasons(t *testing.T) {
+	var buf bytes.Buffer
+	data := dashboardData{
+		Services: []planner.RouteService{{
+			ServiceArea: models.ServiceArea{Name: "Test Services"},
+			Rank:        3,
+			Reasons:     []string{"EV charging", "Rated 4.0"},
+		}},
+		Route: routeData{Geometry: []geo.Point{{Lat: 52, Lon: -1}, {Lat: 53, Lon: -1}}},
+	}
 	if err := templates.ExecuteTemplate(&buf, "index.html", data); err != nil {
 		t.Fatal(err)
 	}
 	html := buf.String()
-	if !strings.Contains(html, `name="ev" checked`) {
-		t.Error("EV checkbox not checked")
-	}
-	if strings.Contains(html, `name="fuel" checked`) {
-		t.Error("fuel checkbox checked, want unchecked")
+	for _, want := range []string{"<td>#3</td>", `<span class="badge">EV charging</span>`, `<span class="badge">Rated 4.0</span>`} {
+		if !strings.Contains(html, want) {
+			t.Errorf("missing %s", want)
+		}
 	}
 }

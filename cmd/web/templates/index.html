@@ -16,7 +16,7 @@
     form { display: grid; gap: 16px; margin-top: 16px; }
     .form-row { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; align-items: end; }
     label { display: block; font-size: 0.9rem; font-weight: 600; margin-bottom: 6px; }
-    input[type="text"], input[type="number"] { width: 100%; padding: 10px 12px; border: 1px solid #d1d5db; border-radius: 10px; }
+    input[type="text"], input[type="number"], select { width: 100%; padding: 10px 12px; border: 1px solid #d1d5db; border-radius: 10px; }
     input[type="checkbox"] { margin-right: 8px; }
     button { border: none; padding: 12px 18px; border-radius: 10px; background: #2563eb; color: white; font-weight: 700; cursor: pointer; }
     button:hover { background: #1d4ed8; }
@@ -60,18 +60,18 @@
             <label for="operator">Operator</label>
             <input id="operator" name="operator" type="text" value="{{.Filters.Operator}}" placeholder="Moto, Welcome Break">
           </div>
+        </div>
+        <div class="form-row">
+          {{range .PrefControls}}
           <div>
-            <label>
-              <input type="checkbox" name="fuel" {{if .Prefs.RequireFuel}}checked{{end}}>
-              With fuel
-            </label>
+            <label for="pref-{{.Name}}">{{.Label}}</label>
+            <select id="pref-{{.Name}}" name="{{.Name}}">
+              <option value="any">Don't care</option>
+              <option value="prefer"{{if eq .Value.String "prefer"}} selected{{end}}>Nice to have</option>
+              <option value="require"{{if eq .Value.String "require"}} selected{{end}}>Must have</option>
+            </select>
           </div>
-          <div>
-            <label>
-              <input type="checkbox" name="ev" {{if .Prefs.RequireEV}}checked{{end}}>
-              With EV charging
-            </label>
-          </div>
+          {{end}}
         </div>
         <div class="form-row">
           <div>
@@ -120,7 +120,7 @@
           <tr>
             <th>Name</th>
             <th>Road</th>
-            {{if $.Route.Geometry}}<th>Along route</th>{{end}}
+            {{if $.Route.Geometry}}<th>Along route</th><th>Rank</th><th>Why</th>{{end}}
             <th>Operator</th>
             <th>Rating</th>
             <th>Fuel</th>
@@ -134,7 +134,11 @@
           <tr>
             <td><a href="{{.MSOURL}}" target="_blank" rel="noreferrer noopener">{{.Name}}</a></td>
             <td>{{.Road}}</td>
-            {{if $.Route.Geometry}}<td>{{printf "%.0f km" .AlongKM}}</td>{{end}}
+            {{if $.Route.Geometry}}
+            <td>{{printf "%.0f km" .AlongKM}}</td>
+            <td>#{{.Rank}}</td>
+            <td>{{range .Reasons}}<span class="badge">{{.}}</span> {{end}}</td>
+            {{end}}
             <td>{{.Operator}}</td>
             <td>{{printf "%.1f" .MSOrating}}</td>
             <td>{{if .Facilities.FuelBrands}}{{join .Facilities.FuelBrands ", "}}{{else}}—{{end}}</td>
