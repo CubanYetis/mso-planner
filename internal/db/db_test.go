@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -124,6 +125,9 @@ func TestListServicesMissingCoordinates(t *testing.T) {
 	}
 	insert(prefix+"-null", nil, nil)
 	insert(prefix+"-zero", 0, 0)
+	insert(prefix+"-null-lat", nil, -1.25)
+	insert(prefix+"-null-lon", 52.5, nil)
+	insert(prefix+"-zero-lon", 51.5, 0) // Greenwich meridian: genuinely geocoded
 	insert(prefix+"-geocoded", 52.5, -1.25)
 	t.Cleanup(func() {
 		p.pool.Exec(ctx, `DELETE FROM service_areas WHERE slug LIKE $1`, prefix+"%")
@@ -136,14 +140,83 @@ func TestListServicesMissingCoordinates(t *testing.T) {
 	got := map[string]bool{}
 	for _, sa := range missing {
 		got[sa.Slug] = true
-		if sa.Postcode != "LE1 1AA" {
+		// The database may be reused, so only check rows this test inserted.
+		if strings.HasPrefix(sa.Slug, prefix) && sa.Postcode != "LE1 1AA" {
 			t.Errorf("%s: postcode = %q, want LE1 1AA", sa.Slug, sa.Postcode)
 		}
 	}
-	if !got[prefix+"-null"] || !got[prefix+"-zero"] {
+	if !got[prefix+"-null"] || !got[prefix+"-zero"] || !got[prefix+"-null-lat"] || !got[prefix+"-null-lon"] {
 		t.Errorf("null and zero rows should be missing coordinates, got %v", got)
 	}
-	if got[prefix+"-geocoded"] {
+	if got[prefix+"-geocoded"] || got[prefix+"-zero-lon"] {
 		t.Error("geocoded row reported as missing coordinates")
+	}
+}
+
+// TestListServicesHalfNullCoordinates is a regression test: a row with only
+// one coordinate set must come back as (0, 0), not with the NULL half
+// silently turned into a real-looking coordinate, while a genuine zero
+// longitude is preserved.
+func TestListServicesHalfNullCoordinates(t *testing.T) {
+	p := testPool(t)
+	ctx := context.Background()
+	prefix := fmt.Sprintf("half-null-%d", time.Now().UnixNano())
+
+	for slug, c := range map[string][2]interface{}{
+		prefix + "-null-lon": {52.5, nil},
+		prefix + "-zero-lon": {51.5, 0},
+	} {
+		var id int64
+		if err := p.pool.QueryRow(ctx, `
+			INSERT INTO service_areas (slug, name, mso_url, road, direction, latitude, longitude)
+			VALUES ($1, $1, 'https://example.com/'||$1, 'M1', 'both', $2, $3)
+			RETURNING id
+		`, slug, c[0], c[1]).Scan(&id); err != nil {
+			t.Fatalf("inserting %s: %v", slug, err)
+		}
+		if _, err := p.pool.Exec(ctx, `INSERT INTO facilities (service_area_id) VALUES ($1)`, id); err != nil {
+			t.Fatalf("inserting facilities: %v", err)
+		}
+		if _, err := p.pool.Exec(ctx, `INSERT INTO service_roads (service_area_id, road) VALUES ($1, 'M1')`, id); err != nil {
+			t.Fatalf("inserting service_roads: %v", err)
+		}
+	}
+	t.Cleanup(func() {
+		p.pool.Exec(ctx, `DELETE FROM service_areas WHERE slug LIKE $1`, prefix+"%")
+	})
+
+	services, err := p.ListServices(ctx, ListServicesOptions{Road: "M1", Limit: 1000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, sa := range services {
+		switch sa.Slug {
+		case prefix + "-null-lon":
+			if sa.Latitude != 0 || sa.Longitude != 0 {
+				t.Errorf("null-lon: got (%v, %v), want (0, 0)", sa.Latitude, sa.Longitude)
+			}
+		case prefix + "-zero-lon":
+			if sa.Latitude != 51.5 || sa.Longitude != 0 {
+				t.Errorf("zero-lon: got (%v, %v), want (51.5, 0)", sa.Latitude, sa.Longitude)
+			}
+		}
+	}
+}
+
+// TestMigrateCreatesGeocodeCache is a regression test for the backfill
+// command, which geocodes through the cache and so needs Migrate to have run
+// even against a database that predates the table.
+func TestMigrateCreatesGeocodeCache(t *testing.T) {
+	p := testPool(t)
+	ctx := context.Background()
+
+	if _, err := p.pool.Exec(ctx, `DROP TABLE geocode_cache`); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	if _, _, _, err := p.GetGeocode(ctx, "after migrate"); err != nil {
+		t.Errorf("GetGeocode after Migrate: %v", err)
 	}
 }

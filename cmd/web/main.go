@@ -52,6 +52,10 @@ var templates = template.Must(template.New("dashboard").Funcs(template.FuncMap{
 // anchored so that "A1" and "A1(M)", which are different roads, never collapse.
 var roadRefRegexp = regexp.MustCompile(`^([AMN]\d+)\s?(\(M\))?(\s?TOLL)?$`)
 
+// maxListLimit is the most services ListServices will return; it matches the
+// cap inside db.ListServices.
+const maxListLimit = 1000
+
 type dashboardFilters struct {
 	Road     string
 	Operator string
@@ -62,6 +66,7 @@ type dashboardFilters struct {
 	Limit    int
 }
 
+// routePoint is a point on a planned route.
 type routePoint = geo.Point
 
 // routeService is a ServiceArea plus where it falls on the planned route,
@@ -72,6 +77,7 @@ type routeService struct {
 	AlongMeters float64
 }
 
+// AlongKM is AlongMeters in kilometres, for display.
 func (s routeService) AlongKM() float64 {
 	return s.AlongMeters / 1000
 }
@@ -223,13 +229,20 @@ func makeHandler(pool *db.Pool, gc *geo.Geocoder, rt *geo.Router) http.HandlerFu
 			}
 		}
 
+		// With a route, the limit applies to route-ordered matches below, not to
+		// the candidates: limiting by name first would drop services that are on
+		// the route in favour of alphabetically earlier ones that are not.
+		listLimit := filters.Limit
+		if len(route.Geometry) > 0 {
+			listLimit = maxListLimit
+		}
 		listed, err := pool.ListServices(ctx, db.ListServicesOptions{
 			Road:     filters.Road,
 			Roads:    route.Roads,
 			Operator: filters.Operator,
 			WithFuel: filters.WithFuel,
 			WithEV:   filters.WithEV,
-			Limit:    filters.Limit,
+			Limit:    listLimit,
 		})
 		if err != nil {
 			renderTemplate(w, dashboardData{Error: fmt.Sprintf("could not load services: %v", err)})
@@ -244,6 +257,9 @@ func makeHandler(pool *db.Pool, gc *geo.Geocoder, rt *geo.Router) http.HandlerFu
 			// captured at scrape time — none are geocoded here, while a user
 			// waits; services without coordinates simply don't appear.
 			services = servicesNearRoute(listed, route.Geometry)
+			if len(services) > filters.Limit {
+				services = services[:filters.Limit]
+			}
 		}
 
 		routeJSON := template.JS("null")
@@ -267,6 +283,7 @@ func makeHandler(pool *db.Pool, gc *geo.Geocoder, rt *geo.Router) http.HandlerFu
 	}
 }
 
+// parseFilters reads the dashboard filters from the query string.
 func parseFilters(r *http.Request) dashboardFilters {
 	query := r.URL.Query()
 	limit := 200
@@ -373,11 +390,8 @@ func servicesNearRoute(services []models.ServiceArea, geometry []routePoint) []r
 		if sa.Latitude == 0 && sa.Longitude == 0 {
 			continue
 		}
-		m, ok := nearestOnRoute(sa.Latitude, sa.Longitude, geometry)
+		m, ok := nearestOnRoute(sa.Latitude, sa.Longitude, sa.Direction, geometry)
 		if !ok || m.distMeters > routeMatchDistanceMeters {
-			continue
-		}
-		if !directionMatchesBearing(sa.Direction, m.bearing) {
 			continue
 		}
 		out = append(out, routeService{ServiceArea: sa, AlongMeters: m.alongMeters})
@@ -414,6 +428,7 @@ func directionMatchesBearing(direction string, bearing float64) bool {
 	return diff <= directionConeHalfAngleDegrees
 }
 
+// wrapServices wraps services without route positions, for when no route is planned.
 func wrapServices(services []models.ServiceArea) []routeService {
 	out := make([]routeService, len(services))
 	for i, sa := range services {
@@ -431,9 +446,11 @@ type routeMatch struct {
 	bearing     float64 // compass heading of the winning segment, degrees
 }
 
-// nearestOnRoute finds the closest point on geometry to (lat, lon). ok is
-// false when the route has no segments to measure against.
-func nearestOnRoute(lat, lon float64, geometry []routePoint) (m routeMatch, ok bool) {
+// nearestOnRoute finds the closest point on geometry to (lat, lon) among the
+// segments whose bearing suits direction, so a nearby segment heading the wrong
+// way (a loop, or the other carriageway) can't shadow a matching one. ok is
+// false when no segment qualifies.
+func nearestOnRoute(lat, lon float64, direction string, geometry []routePoint) (m routeMatch, ok bool) {
 	if len(geometry) < 2 {
 		return routeMatch{}, false
 	}
@@ -441,15 +458,19 @@ func nearestOnRoute(lat, lon float64, geometry []routePoint) (m routeMatch, ok b
 	var cum float64
 	for i := 0; i < len(geometry)-1; i++ {
 		segLen := haversineMeters(geometry[i].Lat, geometry[i].Lon, geometry[i+1].Lat, geometry[i+1].Lon)
-		d, t := distancePointToSegmentMeters(lat, lon, geometry[i], geometry[i+1])
-		if d < m.distMeters {
-			m.distMeters = d
-			m.alongMeters = cum + t*segLen
-			m.bearing = bearingDegrees(geometry[i], geometry[i+1])
+		bearing := bearingDegrees(geometry[i], geometry[i+1])
+		if directionMatchesBearing(direction, bearing) {
+			d, t := distancePointToSegmentMeters(lat, lon, geometry[i], geometry[i+1])
+			if d < m.distMeters {
+				m.distMeters = d
+				m.alongMeters = cum + t*segLen
+				m.bearing = bearing
+				ok = true
+			}
 		}
 		cum += segLen
 	}
-	return m, true
+	return m, ok
 }
 
 // distancePointToSegmentMeters returns the distance from (lat, lon) to segment
@@ -498,6 +519,7 @@ func bearingDegrees(a, b routePoint) float64 {
 	return math.Mod(math.Atan2(y, x)*180/math.Pi+360, 360)
 }
 
+// haversineMeters returns the great-circle distance between two points.
 func haversineMeters(lat1, lon1, lat2, lon2 float64) float64 {
 	phi1 := degreesToRadians(lat1)
 	phi2 := degreesToRadians(lat2)
@@ -510,10 +532,12 @@ func haversineMeters(lat1, lon1, lat2, lon2 float64) float64 {
 	return earthRadiusMeters * c
 }
 
+// degreesToRadians converts degrees to radians.
 func degreesToRadians(deg float64) float64 {
 	return deg * math.Pi / 180
 }
 
+// renderTemplate renders the dashboard page, or a 500 if the template fails.
 func renderTemplate(w http.ResponseWriter, data dashboardData) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := templates.ExecuteTemplate(w, "index.html", data); err != nil {

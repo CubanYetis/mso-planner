@@ -24,6 +24,13 @@ import (
 	"github.com/BigRedS/mso-planner/internal/geo"
 )
 
+// Deadlines for a single database operation and a single geocode (which may
+// wait on the rate limiter before making its request).
+const (
+	dbTimeout      = 30 * time.Second
+	geocodeTimeout = 2 * time.Minute
+)
+
 func main() {
 	log.SetFlags(log.Ltime | log.Lshortfile)
 
@@ -36,14 +43,28 @@ func main() {
 		log.Fatal(err)
 	}
 
-	ctx := context.Background()
+	// No context spans the whole run: the rate-limited loop below can legitimately
+	// take a long time. Each step gets its own deadline instead.
+	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
 	pool, err := db.Connect(ctx, dsn)
+	cancel()
 	if err != nil {
 		log.Fatalf("Database connection failed: %v", err)
 	}
 	defer pool.Close()
 
+	// The geocoder reads and writes geocode_cache, which a database older than
+	// that table won't have yet.
+	ctx, cancel = context.WithTimeout(context.Background(), dbTimeout)
+	err = pool.Migrate(ctx)
+	cancel()
+	if err != nil {
+		log.Fatalf("Migration failed: %v", err)
+	}
+
+	ctx, cancel = context.WithTimeout(context.Background(), dbTimeout)
 	pending, err := pool.ListServicesMissingCoordinates(ctx)
+	cancel()
 	if err != nil {
 		log.Fatalf("Listing services: %v", err)
 	}
@@ -62,13 +83,18 @@ func main() {
 			failed++
 			continue
 		}
-		lat, lon, err := geocoder.Geocode(ctx, query)
+		geoCtx, cancelGeo := context.WithTimeout(context.Background(), geocodeTimeout)
+		lat, lon, err := geocoder.Geocode(geoCtx, query)
+		cancelGeo()
 		if err != nil {
 			log.Printf("%s: geocoding %q failed: %v", sa.Slug, query, err)
 			failed++
 			continue
 		}
-		if err := pool.UpdateServiceCoordinates(ctx, sa.Slug, lat, lon); err != nil {
+		updateCtx, cancelUpdate := context.WithTimeout(context.Background(), dbTimeout)
+		err = pool.UpdateServiceCoordinates(updateCtx, sa.Slug, lat, lon)
+		cancelUpdate()
+		if err != nil {
 			log.Printf("%s: storing coordinates failed: %v", sa.Slug, err)
 			failed++
 			continue

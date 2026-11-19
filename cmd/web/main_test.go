@@ -128,17 +128,17 @@ func TestDistancePointToSegmentMeters(t *testing.T) {
 }
 
 func TestNearestOnRoute(t *testing.T) {
-	if _, ok := nearestOnRoute(52, -1, nil); ok {
+	if _, ok := nearestOnRoute(52, -1, "both", nil); ok {
 		t.Error("empty route: ok = true, want false")
 	}
-	if _, ok := nearestOnRoute(52, -1, []routePoint{{Lat: 52, Lon: -1}}); ok {
+	if _, ok := nearestOnRoute(52, -1, "both", []routePoint{{Lat: 52, Lon: -1}}); ok {
 		t.Error("single point: ok = true, want false")
 	}
 
 	route := []routePoint{{Lat: 52, Lon: -1}, {Lat: 52, Lon: -0.9}, {Lat: 52.1, Lon: -0.9}}
 
 	// Nearest to the second (north-south) segment, not the first.
-	m, ok := nearestOnRoute(52.05, -0.89, route)
+	m, ok := nearestOnRoute(52.05, -0.89, "both", route)
 	if !ok {
 		t.Fatal("ok = false, want true")
 	}
@@ -266,5 +266,29 @@ func TestBearingDegrees(t *testing.T) {
 				t.Errorf("got %.1f, want %.1f", got, tt.want)
 			}
 		})
+	}
+}
+
+// TestNearestOnRouteSkipsWrongHeadingSegment is a regression test: a route
+// that doubles back past a service must match the segment heading the right
+// way, even though the wrong-way segment is closer.
+func TestNearestOnRouteSkipsWrongHeadingSegment(t *testing.T) {
+	// Goes north along lon -1, then returns south along lon -0.99.
+	route := []routePoint{{Lat: 52, Lon: -1}, {Lat: 52.1, Lon: -1}, {Lat: 52.1, Lon: -0.99}, {Lat: 52, Lon: -0.99}}
+	// Nearer the southbound leg, but signed northbound.
+	m, ok := nearestOnRoute(52.05, -0.9905, "northbound", route)
+	if !ok {
+		t.Fatal("ok = false, want a match on the northbound leg")
+	}
+	if math.Abs(m.bearing-0) > 1 && math.Abs(m.bearing-360) > 1 {
+		t.Errorf("bearing = %.1f, want ~0 (northbound leg)", m.bearing)
+	}
+	wantAlong := haversineMeters(52, -1, 52.05, -1)
+	if math.Abs(m.alongMeters-wantAlong) > 15 {
+		t.Errorf("along = %.0f m, want %.0f m", m.alongMeters, wantAlong)
+	}
+
+	if _, ok := nearestOnRoute(52.05, -1, "eastbound", []routePoint{{Lat: 52, Lon: -1}, {Lat: 53, Lon: -1}}); ok {
+		t.Error("no eastbound segment: ok = true, want false")
 	}
 }

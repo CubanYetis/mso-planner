@@ -32,6 +32,7 @@ func Connect(ctx context.Context, dsn string) (*Pool, error) {
 	return &Pool{pool: pool}, nil
 }
 
+// Close releases the connection pool.
 func (p *Pool) Close() {
 	p.pool.Close()
 }
@@ -219,6 +220,8 @@ func (p *Pool) UpsertServiceArea(ctx context.Context, sa models.ServiceArea) err
 	return tx.Commit(ctx)
 }
 
+// UpdateServiceCoordinates stores geocoded coordinates for the service with
+// the given slug.
 func (p *Pool) UpdateServiceCoordinates(ctx context.Context, slug string, lat, lon float64) error {
 	_, err := p.pool.Exec(ctx, `
 		UPDATE service_areas
@@ -235,7 +238,7 @@ func (p *Pool) ListServicesMissingCoordinates(ctx context.Context) ([]models.Ser
 	rows, err := p.pool.Query(ctx, `
 		SELECT slug, COALESCE(postcode, ''), COALESCE(address, '')
 		FROM service_areas
-		WHERE COALESCE(latitude, 0) = 0 AND COALESCE(longitude, 0) = 0
+		WHERE latitude IS NULL OR longitude IS NULL OR (latitude = 0 AND longitude = 0)
 		ORDER BY slug
 	`)
 	if err != nil {
@@ -334,6 +337,8 @@ func (p *Pool) QueryByRoad(ctx context.Context, road string) ([]models.ServiceAr
 	return out, rows.Err()
 }
 
+// ListServicesOptions are the optional filters for ListServices. Zero values
+// mean "no filter"; Limit defaults to 200 and is capped at 1000.
 type ListServicesOptions struct {
 	Road     string
 	Roads    []string
@@ -343,6 +348,9 @@ type ListServicesOptions struct {
 	Limit    int
 }
 
+// ListServices returns services matching opts, ordered by name. A service
+// with only one of latitude/longitude set is returned with both as 0, the same
+// "no coordinates" marker as a service with neither.
 func (p *Pool) ListServices(ctx context.Context, opts ListServicesOptions) ([]models.ServiceArea, error) {
 	// Nullable text columns are COALESCEd to "" because the scan targets are
 	// plain strings; the scraper never writes NULLs, but hand-maintained rows
@@ -350,7 +358,8 @@ func (p *Pool) ListServices(ctx context.Context, opts ListServicesOptions) ([]mo
 	query := `
 		SELECT DISTINCT sa.slug, sa.name, sa.mso_url, sa.road, sa.direction,
 		       COALESCE(sa.location_raw, ''), COALESCE(sa.postcode, ''), COALESCE(sa.address, ''),
-		       COALESCE(sa.latitude, 0), COALESCE(sa.longitude, 0), COALESCE(sa.operator, ''), sa.mso_rating,
+		       CASE WHEN sa.latitude IS NULL OR sa.longitude IS NULL THEN 0 ELSE sa.latitude END,
+		       CASE WHEN sa.latitude IS NULL OR sa.longitude IS NULL THEN 0 ELSE sa.longitude END, COALESCE(sa.operator, ''), sa.mso_rating,
 		       COALESCE(sa.last_scraped_at::text, ''),
 		       f.catering_brands, f.fuel_brands, f.forecourt_shops, f.hotels,
 		       f.has_showers, f.has_atm, f.has_play_area, f.has_lpg, f.hgv_access,
