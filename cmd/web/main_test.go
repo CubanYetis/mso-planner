@@ -3,9 +3,11 @@ package main
 import (
 	"bytes"
 	"io"
+
 	"net/url"
 	"regexp"
 	"strings"
+
 	"testing"
 
 	"github.com/BigRedS/mso-planner/internal/geo"
