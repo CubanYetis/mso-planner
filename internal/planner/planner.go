@@ -25,6 +25,7 @@ type RouteService struct {
 	Rank        int      // 1 is the best stop on the route
 	Reasons     []string // why it ranks where it does, for badges
 
+
 }
 
 // AlongKM is AlongMeters in kilometres, for display.

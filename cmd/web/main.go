@@ -155,6 +155,7 @@ func makeHandler(pool *db.Pool, gc *geo.Geocoder, rt *geo.Router) http.HandlerFu
 		if len(route.Geometry) > 0 {
 			services = planner.Rank(services, prefs)
 
+
 		}
 
 		routeJSON := template.JS("null")
