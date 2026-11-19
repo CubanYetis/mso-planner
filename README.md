@@ -94,6 +94,10 @@ geocoding (or some geocoding failed), run the backfill once:
 go run ./cmd/geocode-backfill
 ```
 
+`/healthz` reports whether the database is reachable (200/503), for a
+container health check. SIGINT/SIGTERM trigger a graceful shutdown: the
+server stops accepting new requests but finishes in-flight ones first.
+
 ### Tests
 
 Most tests need nothing. The database-backed ones skip unless `MSO_TEST_DSN`
