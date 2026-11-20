@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -47,6 +48,9 @@ func (p *Pool) Ping(ctx context.Context) error {
 // database uses the same key for a different purpose.
 const migrateLockKey = 7346_1001
 
+// unlockTimeout bounds releasing the migration lock after Migrate finishes.
+const unlockTimeout = 5 * time.Second
+
 // Migrate creates the schema if it doesn't exist.
 // We keep migrations inline here for simplicity; for a real project
 // you'd use golang-migrate or similar.
@@ -82,11 +86,14 @@ func (p *Pool) Migrate(ctx context.Context) error {
 	}
 	defer func() {
 		// A session lock outlives errors and cancelled contexts, so unlock
-		// with a fresh context. If even that fails, close the connection
-		// rather than return it to the pool still holding the lock: closing
-		// is what releases it, and pgxpool discards closed connections.
-		if _, err := conn.Exec(context.Background(), "SELECT pg_advisory_unlock($1)", migrateLockKey); err != nil {
-			conn.Conn().Close(context.Background())
+		// with a fresh context (with a deadline, so a dead connection can't
+		// hang us). If even that fails, close the connection rather than
+		// return it to the pool still holding the lock: closing is what
+		// releases it, and pgxpool discards closed connections.
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), unlockTimeout)
+		defer cancel()
+		if _, err := conn.Exec(cleanupCtx, "SELECT pg_advisory_unlock($1)", migrateLockKey); err != nil {
+			conn.Conn().Close(cleanupCtx)
 		}
 	}()
 

@@ -134,3 +134,12 @@ func TestNearestOnRouteSkipsWrongHeadingSegment(t *testing.T) {
 		t.Error("no eastbound segment: ok = true, want false")
 	}
 }
+
+// TestNearestOnRouteIgnoresZeroLengthSegment is a regression test: a repeated
+// route point has bearing 0 and used to match any northbound service.
+func TestNearestOnRouteIgnoresZeroLengthSegment(t *testing.T) {
+	route := []geo.Point{{Lat: 52, Lon: -1}, {Lat: 52, Lon: -1}}
+	if _, ok := nearestOnRoute(52, -1, "northbound", route); ok {
+		t.Error("zero-length route: ok = true, want false")
+	}
+}

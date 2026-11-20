@@ -29,8 +29,10 @@ func nearestOnRoute(lat, lon float64, direction string, geometry []geo.Point) (m
 	var cum float64
 	for i := 0; i < len(geometry)-1; i++ {
 		segLen := haversineMeters(geometry[i].Lat, geometry[i].Lon, geometry[i+1].Lat, geometry[i+1].Lon)
+		// A zero-length segment has no heading (its bearing comes out as 0,
+		// which would pass for northbound), so it can't match any direction.
 		bearing := bearingDegrees(geometry[i], geometry[i+1])
-		if directionMatchesBearing(direction, bearing) {
+		if segLen > 0 && directionMatchesBearing(direction, bearing) {
 			d, t := distancePointToSegmentMeters(lat, lon, geometry[i], geometry[i+1])
 			if d < m.distMeters {
 				m.distMeters = d

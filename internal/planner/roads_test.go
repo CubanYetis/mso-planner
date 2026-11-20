@@ -72,3 +72,13 @@ func TestExtractRoadNamesMultipleRefs(t *testing.T) {
 		t.Errorf("got %v, want %v (A1(M) and A1 kept separate; non-UK refs dropped)", got, want)
 	}
 }
+
+// TestExtractRoadNamesRefWinsOverName is a regression test: a step whose Ref
+// is one road and whose Name spells out another must yield only the Ref.
+func TestExtractRoadNamesRefWinsOverName(t *testing.T) {
+	got := ExtractRoadNames([]geo.Step{{Name: "M6", Ref: "M6 Toll"}, {Name: "A1(M)", Ref: "E15"}})
+	want := []string{"M6 Toll", "A1(M)"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %v, want %v (Name only when Ref has no road)", got, want)
+	}
+}

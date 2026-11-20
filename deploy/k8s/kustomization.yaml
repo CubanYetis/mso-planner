@@ -1,6 +1,6 @@
 # Deploys web + weekly scraper to farfaraway:
 #
-#   cp credentials.env.example credentials.env   # then fill it in
+#   cp deploy/k8s/credentials.env.example deploy/k8s/credentials.env   # then fill it in
 #   kubectl apply -k deploy/k8s
 #
 # Postgres is external (on donkey, outside the cluster); see the README's

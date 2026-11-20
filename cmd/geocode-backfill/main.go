@@ -103,4 +103,9 @@ func main() {
 	}
 	log.Printf("Done: %d updated, %d failed, %d untouched in %s",
 		updated, failed, len(pending)-updated-failed, time.Since(start).Round(time.Second))
+	// Non-zero so a Kubernetes Job doesn't report success when records are
+	// still without coordinates. Re-running only retries those.
+	if failed > 0 {
+		os.Exit(1)
+	}
 }

@@ -20,15 +20,24 @@ func ExtractRoadNames(steps []geo.Step) []string {
 	var roads []string
 
 	for _, step := range steps {
-		candidates := strings.Split(step.Ref, ";")
-		candidates = append(candidates, step.Name)
-		for _, c := range candidates {
-			road := normalizeRoadName(c)
-			if road == "" || seen[road] {
-				continue
+		var found []string
+		for _, c := range strings.Split(step.Ref, ";") {
+			if road := normalizeRoadName(c); road != "" {
+				found = append(found, road)
 			}
-			seen[road] = true
-			roads = append(roads, road)
+		}
+		// A step with a road number in Ref is on that road; its Name is then
+		// just another label for it ("M6 Toll" with Ref "M6" is one road).
+		if len(found) == 0 {
+			if road := normalizeRoadName(step.Name); road != "" {
+				found = append(found, road)
+			}
+		}
+		for _, road := range found {
+			if !seen[road] {
+				seen[road] = true
+				roads = append(roads, road)
+			}
 		}
 	}
 

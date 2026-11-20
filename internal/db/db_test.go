@@ -11,6 +11,16 @@ import (
 	"time"
 )
 
+// testContext returns a context with a deadline, so a hung database fails the
+// test instead of hanging the run. It is cancelled after the test's other
+// cleanups, so they can use it too.
+func testContext(t *testing.T) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	t.Cleanup(cancel)
+	return ctx
+}
+
 // testPool connects to the Postgres named by MSO_TEST_DSN and skips the test
 // if it isn't set. Use a throwaway database, not your real one:
 //
@@ -22,7 +32,7 @@ func testPool(t *testing.T) *Pool {
 	if dsn == "" {
 		t.Skip("MSO_TEST_DSN not set")
 	}
-	ctx := context.Background()
+	ctx := testContext(t)
 	p, err := Connect(ctx, dsn)
 	if err != nil {
 		t.Fatalf("connecting: %v", err)
@@ -37,7 +47,7 @@ func testPool(t *testing.T) *Pool {
 // TestGeocodeCache verifies cache misses, writes, and subsequent reads.
 func TestGeocodeCache(t *testing.T) {
 	p := testPool(t)
-	ctx := context.Background()
+	ctx := testContext(t)
 	key := fmt.Sprintf("test query %d", time.Now().UnixNano())
 
 	_, _, ok, err := p.GetGeocode(ctx, key)
@@ -67,7 +77,7 @@ func TestGeocodeCache(t *testing.T) {
 // writes "") must not break ListServices.
 func TestListServicesNullColumns(t *testing.T) {
 	p := testPool(t)
-	ctx := context.Background()
+	ctx := testContext(t)
 	slug := fmt.Sprintf("null-columns-%d", time.Now().UnixNano())
 
 	var id int64
@@ -91,7 +101,9 @@ func TestListServicesNullColumns(t *testing.T) {
 		t.Fatalf("inserting service_roads: %v", err)
 	}
 	t.Cleanup(func() {
-		p.pool.Exec(ctx, `DELETE FROM service_areas WHERE id = $1`, id)
+		if _, err := p.pool.Exec(ctx, `DELETE FROM service_areas WHERE id = $1`, id); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
 	})
 
 	services, err := p.ListServices(ctx, ListServicesOptions{Road: "M1"})
@@ -113,7 +125,7 @@ func TestListServicesNullColumns(t *testing.T) {
 // are both treated as missing, and real coordinates are not.
 func TestListServicesMissingCoordinates(t *testing.T) {
 	p := testPool(t)
-	ctx := context.Background()
+	ctx := testContext(t)
 	prefix := fmt.Sprintf("missing-coords-%d", time.Now().UnixNano())
 
 	insert := func(slug string, lat, lon interface{}) {
@@ -132,7 +144,9 @@ func TestListServicesMissingCoordinates(t *testing.T) {
 	insert(prefix+"-zero-lon", 51.5, 0) // Greenwich meridian: genuinely geocoded
 	insert(prefix+"-geocoded", 52.5, -1.25)
 	t.Cleanup(func() {
-		p.pool.Exec(ctx, `DELETE FROM service_areas WHERE slug LIKE $1`, prefix+"%")
+		if _, err := p.pool.Exec(ctx, `DELETE FROM service_areas WHERE slug LIKE $1`, prefix+"%"); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
 	})
 
 	missing, err := p.ListServicesMissingCoordinates(ctx)
@@ -161,7 +175,7 @@ func TestListServicesMissingCoordinates(t *testing.T) {
 // longitude is preserved.
 func TestListServicesHalfNullCoordinates(t *testing.T) {
 	p := testPool(t)
-	ctx := context.Background()
+	ctx := testContext(t)
 	prefix := fmt.Sprintf("half-null-%d", time.Now().UnixNano())
 
 	for slug, c := range map[string][2]interface{}{
@@ -184,14 +198,19 @@ func TestListServicesHalfNullCoordinates(t *testing.T) {
 		}
 	}
 	t.Cleanup(func() {
-		p.pool.Exec(ctx, `DELETE FROM service_areas WHERE slug LIKE $1`, prefix+"%")
+		if _, err := p.pool.Exec(ctx, `DELETE FROM service_areas WHERE slug LIKE $1`, prefix+"%"); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
 	})
 
 	services, err := p.ListServices(ctx, ListServicesOptions{Road: "M1", Limit: 1000})
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Without this the checks below would pass if nothing came back at all.
+	seen := map[string]bool{}
 	for _, sa := range services {
+		seen[sa.Slug] = true
 		switch sa.Slug {
 		case prefix + "-null-lon":
 			if sa.Latitude != 0 || sa.Longitude != 0 {
@@ -203,14 +222,27 @@ func TestListServicesHalfNullCoordinates(t *testing.T) {
 			}
 		}
 	}
+	for _, slug := range []string{prefix + "-null-lon", prefix + "-zero-lon"} {
+		if !seen[slug] {
+			t.Errorf("%s not returned by ListServices", slug)
+		}
+	}
 }
 
 // TestMigrateCreatesGeocodeCache is a regression test for the backfill
 // command, which geocodes through the cache and so needs Migrate to have run
 // even against a database that predates the table.
 func TestMigrateCreatesGeocodeCache(t *testing.T) {
-	p := testPool(t)
-	ctx := context.Background()
+	ctx := testContext(t)
+	// Own schema: dropping the table in the shared one would race other tests.
+	p, err := Connect(ctx, freshSchemaDSN(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(p.Close)
+	if err := p.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
 
 	if _, err := p.pool.Exec(ctx, `DROP TABLE geocode_cache`); err != nil {
 		t.Fatal(err)
@@ -232,7 +264,7 @@ func TestMigrateCreatesGeocodeCache(t *testing.T) {
 // The race only happens when the tables don't exist yet, so each run migrates
 // into a fresh, empty schema (via search_path) rather than the shared one.
 func TestMigrateConcurrent(t *testing.T) {
-	ctx := context.Background()
+	ctx := testContext(t)
 	dsn := freshSchemaDSN(t)
 
 	// One pool per goroutine, standing in for separate processes.
@@ -274,7 +306,7 @@ func TestMigrateConcurrent(t *testing.T) {
 // check. That's the web pod restarting mid-scrape, or test packages run in
 // parallel.
 func TestMigrateWhileWriting(t *testing.T) {
-	ctx := context.Background()
+	ctx := testContext(t)
 	dsn := freshSchemaDSN(t)
 	migrator, err := Connect(ctx, dsn)
 	if err != nil {
@@ -331,14 +363,16 @@ func freshSchemaDSN(t *testing.T) string {
 	if dsn == "" {
 		t.Skip("MSO_TEST_DSN not set")
 	}
-	ctx := context.Background()
+	ctx := testContext(t)
 	admin := testPool(t)
 	schemaName := fmt.Sprintf("migrate_test_%d", time.Now().UnixNano())
 	if _, err := admin.pool.Exec(ctx, "CREATE SCHEMA "+schemaName); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		admin.pool.Exec(ctx, "DROP SCHEMA "+schemaName+" CASCADE")
+		if _, err := admin.pool.Exec(ctx, "DROP SCHEMA "+schemaName+" CASCADE"); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
 	})
 
 	u, err := url.Parse(dsn)
