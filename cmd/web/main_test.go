@@ -3,11 +3,10 @@ package main
 import (
 	"bytes"
 	"io"
-
 	"net/url"
+	"reflect"
 	"regexp"
 	"strings"
-
 	"testing"
 
 	"github.com/BigRedS/mso-planner/internal/geo"
@@ -100,5 +99,38 @@ func TestTemplateShowsRankAndReasons(t *testing.T) {
 		if !strings.Contains(html, want) {
 			t.Errorf("missing %s", want)
 		}
+	}
+}
+
+// TestSelectServicesLimitKeepsBestRanked is a regression test: the limit used
+// to keep the first stops along the route, not the best-ranked ones.
+func TestSelectServicesLimitKeepsBestRanked(t *testing.T) {
+	route := []geo.Point{{Lat: 52, Lon: -1}, {Lat: 52, Lon: 0}}
+	listed := []models.ServiceArea{
+		{Slug: "first", Latitude: 52.01, Longitude: -0.8, MSOrating: 2},
+		{Slug: "middle", Latitude: 52.01, Longitude: -0.5, MSOrating: 5},
+		{Slug: "last", Latitude: 52.01, Longitude: -0.2, MSOrating: 4},
+	}
+	got := selectServices(listed, route, planner.Preferences{}, 2)
+	var slugs []string
+	for _, s := range got {
+		slugs = append(slugs, s.Slug)
+	}
+	if want := []string{"middle", "last"}; !reflect.DeepEqual(slugs, want) {
+		t.Errorf("got %v, want %v (best two, in journey order)", slugs, want)
+	}
+}
+
+// TestSelectServicesLimitAfterFilter is a regression test: without a route,
+// the limit used to be applied (in SQL) before the dog-walk requirement, so
+// a service without one could take the only slot and leave the table empty.
+func TestSelectServicesLimitAfterFilter(t *testing.T) {
+	listed := []models.ServiceArea{
+		{Slug: "a-no-dog"},
+		{Slug: "b-dog", Facilities: models.Facilities{DogFriendly: true}},
+	}
+	got := selectServices(listed, nil, planner.Preferences{DogWalk: planner.Require}, 1)
+	if len(got) != 1 || got[0].Slug != "b-dog" {
+		t.Errorf("got %+v, want just b-dog", got)
 	}
 }

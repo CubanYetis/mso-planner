@@ -207,13 +207,9 @@ func makeHandler(pool *db.Pool, gc *geo.Geocoder, rt *geo.Router) http.HandlerFu
 			}
 		}
 
-		// With a route, the limit applies to route-ordered matches below, not to
-		// the candidates: limiting by name first would drop services that are on
-		// the route in favour of alphabetically earlier ones that are not.
-		listLimit := filters.Limit
-		if len(route.Geometry) > 0 {
-			listLimit = maxListLimit
-		}
+		// The limit applies to the final results (see selectServices), not to the
+		// candidates: limiting by name in SQL first would spend the slots on
+		// services that the route match or the preferences then drop.
 		listed, err := pool.ListServices(ctx, db.ListServicesOptions{
 			Road:     filters.Road,
 			Roads:    route.Roads,
@@ -222,31 +218,14 @@ func makeHandler(pool *db.Pool, gc *geo.Geocoder, rt *geo.Router) http.HandlerFu
 			// LIMIT being spent on services that would be filtered out anyway.
 			WithFuel: prefs.Fuel == planner.Require,
 			WithEV:   prefs.EV == planner.Require,
-			Limit:    listLimit,
+			Limit:    maxListLimit,
 		})
 		if err != nil {
 			renderTemplate(w, dashboardData{Error: fmt.Sprintf("could not load services: %v", err)})
 			return
 		}
 
-		services := wrapServices(listed)
-		if len(route.Geometry) > 0 {
-			// With a route planned, only the honest answer will do: if nothing
-			// matches, the table is empty rather than silently reverting to
-			// the unfiltered road list. Services are matched on coordinates
-			// captured at scrape time — none are geocoded here, while a user
-			// waits; services without coordinates simply don't appear.
-			services = planner.ServicesNearRoute(listed, route.Geometry)
-		}
-		services = planner.Filter(services, prefs)
-		if len(route.Geometry) > 0 {
-			services = planner.Rank(services, prefs)
-			// Limit last: truncating before Filter/Rank would drop the
-			// best-ranked stops in favour of earlier-along-the-route ones.
-			if len(services) > filters.Limit {
-				services = services[:filters.Limit]
-			}
-		}
+		services := selectServices(listed, route.Geometry, prefs, filters.Limit)
 
 		routeJSON := template.JS("null")
 		if len(route.Geometry) > 0 {
@@ -366,6 +345,35 @@ func renderTemplate(w http.ResponseWriter, data dashboardData) {
 		http.Error(w, "template rendering failed", http.StatusInternalServerError)
 		slog.Error("template rendering failed", "error", err)
 	}
+}
+
+// selectServices turns the candidate services into the table's rows, applying
+// limit last so that it can't cut anything the earlier steps would have kept.
+//
+// With a route, only the honest answer will do: if nothing matches, the table
+// is empty rather than silently reverting to the unfiltered road list.
+// Services are matched on coordinates captured at scrape time — none are
+// geocoded here, while a user waits; services without coordinates simply don't
+// appear. The survivors are ranked and the limit keeps the best-ranked, still
+// in journey order. Without a route, the first limit survivors are kept.
+func selectServices(listed []models.ServiceArea, geometry []geo.Point, prefs planner.Preferences, limit int) []planner.RouteService {
+	if len(geometry) == 0 {
+		services := planner.Filter(wrapServices(listed), prefs)
+		if len(services) > limit {
+			services = services[:limit]
+		}
+		return services
+	}
+
+	services := planner.Rank(planner.Filter(planner.ServicesNearRoute(listed, geometry), prefs), prefs)
+	var best []planner.RouteService
+	for _, s := range services {
+		// Ranks are distinct, 1..len, so this keeps exactly limit of them.
+		if s.Rank <= limit {
+			best = append(best, s)
+		}
+	}
+	return best
 }
 
 // wrapServices lists services without route positions, for when no route
