@@ -9,6 +9,7 @@ import (
 	"html/template"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -52,8 +53,6 @@ const maxListLimit = 1000
 type dashboardFilters struct {
 	Road     string
 	Operator string
-	WithFuel bool
-	WithEV   bool
 	Start    string
 	End      string
 	Limit    int
@@ -79,6 +78,7 @@ type dashboardData struct {
 	WithFuel        int
 	WithEV          int
 	Filters         dashboardFilters
+	PrefControls    []prefControl
 	Services        []planner.RouteService
 	Error           string
 	Route           routeData
@@ -189,6 +189,7 @@ func makeHealthzHandler(p pinger) http.HandlerFunc {
 func makeHandler(pool *db.Pool, gc *geo.Geocoder, rt *geo.Router) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		filters := parseFilters(r)
+		prefs := parsePreferences(r.URL.Query())
 		ctx := r.Context()
 
 		total, withFuel, withEV, err := pool.Stats(ctx)
@@ -217,8 +218,10 @@ func makeHandler(pool *db.Pool, gc *geo.Geocoder, rt *geo.Router) http.HandlerFu
 			Road:     filters.Road,
 			Roads:    route.Roads,
 			Operator: filters.Operator,
-			WithFuel: filters.WithFuel,
-			WithEV:   filters.WithEV,
+			// planner.Filter below is what decides; this only stops the SQL
+			// LIMIT being spent on services that would be filtered out anyway.
+			WithFuel: prefs.Fuel == planner.Require,
+			WithEV:   prefs.EV == planner.Require,
 			Limit:    listLimit,
 		})
 		if err != nil {
@@ -234,6 +237,12 @@ func makeHandler(pool *db.Pool, gc *geo.Geocoder, rt *geo.Router) http.HandlerFu
 			// captured at scrape time — none are geocoded here, while a user
 			// waits; services without coordinates simply don't appear.
 			services = planner.ServicesNearRoute(listed, route.Geometry)
+		}
+		services = planner.Filter(services, prefs)
+		if len(route.Geometry) > 0 {
+			services = planner.Rank(services, prefs)
+			// Limit last: truncating before Filter/Rank would drop the
+			// best-ranked stops in favour of earlier-along-the-route ones.
 			if len(services) > filters.Limit {
 				services = services[:filters.Limit]
 			}
@@ -252,6 +261,7 @@ func makeHandler(pool *db.Pool, gc *geo.Geocoder, rt *geo.Router) http.HandlerFu
 			WithFuel:        withFuel,
 			WithEV:          withEV,
 			Filters:         filters,
+			PrefControls:    prefControls(prefs),
 			Services:        services,
 			Route:           route,
 			RouteGeometryJS: routeJSON,
@@ -273,11 +283,48 @@ func parseFilters(r *http.Request) dashboardFilters {
 	return dashboardFilters{
 		Road:     strings.ToUpper(strings.TrimSpace(query.Get("road"))),
 		Operator: strings.TrimSpace(query.Get("operator")),
-		WithFuel: query.Get("fuel") == "on" || query.Get("fuel") == "1",
-		WithEV:   query.Get("ev") == "on" || query.Get("ev") == "1",
 		Start:    strings.TrimSpace(query.Get("start")),
 		End:      strings.TrimSpace(query.Get("end")),
 		Limit:    limit,
+	}
+}
+
+// prefControl is one facility's don't care/prefer/require select on the
+// search form.
+type prefControl struct {
+	Name  string // query parameter, as read by parsePreferences
+	Label string
+	Value planner.Want
+}
+
+func prefControls(p planner.Preferences) []prefControl {
+	return []prefControl{
+		{"fuel", "Fuel", p.Fuel},
+		{"ev", "EV charging", p.EV},
+		{"dog", "Dog walk", p.DogWalk},
+	}
+}
+
+// parsePreferences reads the traveller's preferences from the search form:
+// "prefer" or "require" per facility, anything else meaning don't care.
+// "on" and "1" mean require, so links from when these were checkboxes still
+// work.
+func parsePreferences(query url.Values) planner.Preferences {
+	return planner.Preferences{
+		Fuel:    parseWant(query.Get("fuel")),
+		EV:      parseWant(query.Get("ev")),
+		DogWalk: parseWant(query.Get("dog")),
+	}
+}
+
+func parseWant(v string) planner.Want {
+	switch v {
+	case "prefer":
+		return planner.Prefer
+	case "require", "on", "1":
+		return planner.Require
+	default:
+		return planner.DontCare
 	}
 }
 

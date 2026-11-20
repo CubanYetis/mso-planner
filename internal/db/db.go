@@ -43,7 +43,7 @@ func (p *Pool) Ping(ctx context.Context) error {
 }
 
 // migrateLockKey is an arbitrary constant identifying our schema migration
-// to pg_advisory_xact_lock. Any int64 works so long as nothing else in the
+// to pg_advisory_lock. Any int64 works so long as nothing else in the
 // database uses the same key for a different purpose.
 const migrateLockKey = 7346_1001
 
@@ -51,33 +51,56 @@ const migrateLockKey = 7346_1001
 // We keep migrations inline here for simplicity; for a real project
 // you'd use golang-migrate or similar.
 //
-// CREATE TABLE IF NOT EXISTS is not safe against another session creating
-// the same table at the same moment: one of them fails with a duplicate-key
-// error on Postgres's catalog. That happens when web and scraper start
-// together against an empty database, or test packages run in parallel. So
-// the whole schema is applied inside one transaction holding an advisory
-// lock; concurrent callers queue on the lock, and by the time each gets it
-// the tables exist and every statement is a no-op. The lock is released
-// automatically at commit or rollback.
+// It runs on every start of every process, alongside whatever else is using
+// the database, so it has to be safe against two things:
+//
+//   - Another Migrate. CREATE TABLE IF NOT EXISTS is not safe against another
+//     session creating the same table at the same moment: one fails with a
+//     duplicate-key error on Postgres's catalog (web and scraper starting
+//     together on an empty database). So callers queue on an advisory lock,
+//     and by the time each gets it the tables exist.
+//
+//   - Ordinary writes. Some statements lock a table even when they turn out
+//     to be no-ops (ALTER TABLE ... ADD COLUMN IF NOT EXISTS takes an
+//     AccessExclusive lock). Inside one transaction those locks pile up, and
+//     Migrate holding one table while waiting for another deadlocks against
+//     an insert whose foreign-key check needs them in the opposite order. So
+//     each statement commits on its own, and Migrate never holds a table lock
+//     while waiting for another.
+//
+// That's why the lock is session-level (pg_advisory_lock on one connection)
+// rather than tied to a transaction.
 func (p *Pool) Migrate(ctx context.Context) error {
-	tx, err := p.pool.Begin(ctx)
+	conn, err := p.pool.Acquire(ctx)
 	if err != nil {
-		return fmt.Errorf("beginning migration: %w", err)
+		return fmt.Errorf("acquiring connection for migration: %w", err)
 	}
-	// Rollback after a successful Commit is a harmless no-op.
-	defer tx.Rollback(ctx)
+	defer conn.Release()
 
-	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", migrateLockKey); err != nil {
+	if _, err := conn.Exec(ctx, "SELECT pg_advisory_lock($1)", migrateLockKey); err != nil {
 		return fmt.Errorf("taking migration lock: %w", err)
 	}
-	if _, err := tx.Exec(ctx, schema); err != nil {
-		return fmt.Errorf("applying schema: %w", err)
+	defer func() {
+		// A session lock outlives errors and cancelled contexts, so unlock
+		// with a fresh context. If even that fails, close the connection
+		// rather than return it to the pool still holding the lock: closing
+		// is what releases it, and pgxpool discards closed connections.
+		if _, err := conn.Exec(context.Background(), "SELECT pg_advisory_unlock($1)", migrateLockKey); err != nil {
+			conn.Conn().Close(context.Background())
+		}
+	}()
+
+	for _, stmt := range schema {
+		if _, err := conn.Exec(ctx, stmt); err != nil {
+			return fmt.Errorf("applying schema: %w\n%s", err, stmt)
+		}
 	}
-	return tx.Commit(ctx)
+	return nil
 }
 
-const schema = `
-CREATE TABLE IF NOT EXISTS service_areas (
+// schema is applied one statement at a time; see Migrate for why.
+var schema = []string{
+	`CREATE TABLE IF NOT EXISTS service_areas (
     id              BIGSERIAL PRIMARY KEY,
     slug            TEXT        NOT NULL UNIQUE,
     name            TEXT        NOT NULL,
@@ -92,9 +115,8 @@ CREATE TABLE IF NOT EXISTS service_areas (
     operator        TEXT,
     mso_rating      REAL        DEFAULT 0,
     last_scraped_at TIMESTAMPTZ
-);
-
--- Facilities are in a separate table for clean querying.
+);`,
+	`-- Facilities are in a separate table for clean querying.
 -- One row per service_area (1:1 relationship but kept separate for clarity).
 CREATE TABLE IF NOT EXISTS facilities (
     service_area_id BIGINT PRIMARY KEY REFERENCES service_areas(id) ON DELETE CASCADE,
@@ -116,17 +138,15 @@ CREATE TABLE IF NOT EXISTS facilities (
     outdoor_space_info  TEXT,
     dog_friendly        BOOLEAN DEFAULT FALSE,
     parking_info        TEXT
-);
-
--- Road memberships: a service at a junction belongs to multiple roads.
+);`,
+	`-- Road memberships: a service at a junction belongs to multiple roads.
 -- The scraper primary-keys on the first road seen; this table captures all.
 CREATE TABLE IF NOT EXISTS service_roads (
     service_area_id BIGINT  REFERENCES service_areas(id) ON DELETE CASCADE,
     road            TEXT    NOT NULL,
     PRIMARY KEY (service_area_id, road)
-);
-
--- Sources table: ready for future enrichment (TripAdvisor, Google etc.)
+);`,
+	`-- Sources table: ready for future enrichment (TripAdvisor, Google etc.)
 CREATE TABLE IF NOT EXISTS service_sources (
     id              BIGSERIAL PRIMARY KEY,
     service_area_id BIGINT      REFERENCES service_areas(id) ON DELETE CASCADE,
@@ -136,26 +156,23 @@ CREATE TABLE IF NOT EXISTS service_sources (
     rating          REAL,
     review_count    INTEGER,
     fetched_at      TIMESTAMPTZ
-);
-
--- Geocoding results, so we hit Nominatim at most once per distinct query.
+);`,
+	`-- Geocoding results, so we hit Nominatim at most once per distinct query.
 -- query is normalised (lower-cased, whitespace collapsed) by the geo package.
 CREATE TABLE IF NOT EXISTS geocode_cache (
     query       TEXT             PRIMARY KEY,
     latitude    DOUBLE PRECISION NOT NULL,
     longitude   DOUBLE PRECISION NOT NULL,
     fetched_at  TIMESTAMPTZ      NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS idx_service_areas_road     ON service_areas(road);
-CREATE INDEX IF NOT EXISTS idx_service_areas_operator ON service_areas(operator);
-CREATE INDEX IF NOT EXISTS idx_service_areas_rating   ON service_areas(mso_rating);
-
-ALTER TABLE service_areas ADD COLUMN IF NOT EXISTS latitude DOUBLE PRECISION;
-ALTER TABLE service_areas ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION;
-CREATE INDEX IF NOT EXISTS idx_service_areas_latlon   ON service_areas(latitude, longitude);
-CREATE INDEX IF NOT EXISTS idx_service_roads_road     ON service_roads(road);
-`
+);`,
+	`CREATE INDEX IF NOT EXISTS idx_service_areas_road     ON service_areas(road);`,
+	`CREATE INDEX IF NOT EXISTS idx_service_areas_operator ON service_areas(operator);`,
+	`CREATE INDEX IF NOT EXISTS idx_service_areas_rating   ON service_areas(mso_rating);`,
+	`ALTER TABLE service_areas ADD COLUMN IF NOT EXISTS latitude DOUBLE PRECISION;`,
+	`ALTER TABLE service_areas ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION;`,
+	`CREATE INDEX IF NOT EXISTS idx_service_areas_latlon   ON service_areas(latitude, longitude);`,
+	`CREATE INDEX IF NOT EXISTS idx_service_roads_road     ON service_roads(road);`,
+}
 
 // UpsertServiceArea inserts or updates a service area and its facilities.
 // We upsert on slug so re-running the scraper updates existing records cleanly.

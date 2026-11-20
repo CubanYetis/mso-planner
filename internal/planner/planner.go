@@ -16,11 +16,15 @@ import (
 )
 
 // RouteService is a ServiceArea plus where it falls on the planned route,
-// so callers can show stops in journey order. AlongMeters is 0 when no
-// route was planned.
+// so callers can show stops in journey order, and how it ranks for the
+// traveller. AlongMeters is 0 when no route was planned; Rank and Reasons
+// are unset until Rank is called.
 type RouteService struct {
 	models.ServiceArea
 	AlongMeters float64
+	Rank        int      // 1 is the best stop on the route
+	Reasons     []string // why it ranks where it does, for badges
+
 }
 
 // AlongKM is AlongMeters in kilometres, for display.
