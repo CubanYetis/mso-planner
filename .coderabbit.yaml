@@ -18,3 +18,6 @@ reviews:
       instructions: "The plaintext Postgres password is a deliberate dev-only credential for a throwaway database. Do not flag it."
     - path: "internal/scraper/**"
       instructions: "The scraper must stay polite to motorwayservices.uk (rate limits, honest User-Agent) and every record must keep its link back to MSO for attribution."
+  collapse_walkthrough: true
+  sequence_diagrams: true
+tone_instructions: "Be concise and direct, assume little Go-specific knowledge on the part of the reviewer; explain high-level effects of issues raised and of suggested fixes"

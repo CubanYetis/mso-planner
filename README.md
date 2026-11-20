@@ -13,8 +13,9 @@ Every services record links back to its MSO page. Please credit MSO if you build
 ```
 mso-planner/
 ├── cmd/
-│   ├── scraper/        # Scraper entrypoint
-│   └── web/            # Route-planner web UI (server-rendered, embedded template)
+│   ├── scraper/          # Scraper entrypoint
+│   ├── geocode-backfill/ # One-off: geocode services that have no coordinates
+│   └── web/              # Route-planner web UI (server-rendered, embedded template)
 ├── internal/
 │   ├── geo/            # Nominatim geocoder (rate-limited, Postgres-cached) and OSRM router
 │   ├── models/         # Shared data types
@@ -84,6 +85,15 @@ docker compose --profile app up web
 
 Open <http://localhost:8080> and enter a start and destination.
 
+The web UI never geocodes services itself: route matching uses the
+coordinates captured at scrape time, and services without coordinates simply
+don't appear in route results. If your database predates scrape-time
+geocoding (or some geocoding failed), run the backfill once:
+
+```bash
+go run ./cmd/geocode-backfill
+```
+
 `/healthz` reports whether the database is reachable (200/503), for a
 container health check. SIGINT/SIGTERM trigger a graceful shutdown: the
 server stops accepting new requests but finishes in-flight ones first.
@@ -100,6 +110,36 @@ go test ./...
 ```
 
 Inspect the database with `psql "$MSO_DB_DSN"`. `docker compose down -v` wipes it.
+
+---
+
+## Deploy
+
+Runs on the `farfaraway` k3s cluster from `deploy/k8s` (kustomize): the web
+UI behind Traefik with a cert-manager certificate at
+<https://mso-planner.cubanyetis.net>, and the scraper as a weekly CronJob.
+Images are the `:latest` ones CI pushes to GHCR from main. They must be
+public packages: the cluster has no image pull secret.
+
+```bash
+cp deploy/k8s/credentials.env.example deploy/k8s/credentials.env   # fill in
+kubectl apply -k deploy/k8s
+```
+
+Postgres is outside the cluster, on donkey. It has to accept connections from
+the pod network (k3s: `10.42.0.0/16`), and the database and user must exist
+already. The apps create their own tables.
+
+Day to day:
+
+```bash
+# pick up a new web image (the CronJob pulls a fresh one each run)
+kubectl -n mso-planner rollout restart deployment/web
+# scrape now rather than waiting for Monday
+kubectl -n mso-planner create job scrape-manual-$(date +%s) --from=cronjob/scraper
+# one-off geocode backfill (see cmd/geocode-backfill)
+kubectl -n mso-planner apply -f deploy/k8s/backfill-job.yaml
+```
 
 ---
 
@@ -125,10 +165,11 @@ come from a Kubernetes Secret and are never committed.
 ## Next steps
 
 - [x] OSRM integration (route geometry → nearby services, basic version)
-- [ ] Tests for the pure parsing/geometry functions
+- [x] Tests for the pure parsing/geometry functions
 - [ ] Add PostGIS for spatial queries (currently filtered in Go)
-- [ ] Stop geocoding in the web request path; use a self-hosted OSRM/Nominatim
-- [ ] Write k8s manifests: web Deployment and scraper CronJob (external Postgres)
+- [x] Stop geocoding in the web request path (scrape-time + `geocode-backfill` instead)
+- [ ] Use a self-hosted OSRM/Nominatim instead of the public services
+- [x] Write k8s manifests: web Deployment and scraper CronJob (external Postgres)
 - [ ] Add user preference model and scoring
 
 ---

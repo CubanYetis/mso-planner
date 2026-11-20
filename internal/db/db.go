@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -32,6 +33,7 @@ func Connect(ctx context.Context, dsn string) (*Pool, error) {
 	return &Pool{pool: pool}, nil
 }
 
+// Close releases the connection pool.
 func (p *Pool) Close() {
 	p.pool.Close()
 }
@@ -41,16 +43,71 @@ func (p *Pool) Ping(ctx context.Context) error {
 	return p.pool.Ping(ctx)
 }
 
+// migrateLockKey is an arbitrary constant identifying our schema migration
+// to pg_advisory_lock. Any int64 works so long as nothing else in the
+// database uses the same key for a different purpose.
+const migrateLockKey = 7346_1001
+
+// unlockTimeout bounds releasing the migration lock after Migrate finishes.
+const unlockTimeout = 5 * time.Second
+
 // Migrate creates the schema if it doesn't exist.
 // We keep migrations inline here for simplicity; for a real project
 // you'd use golang-migrate or similar.
+//
+// It runs on every start of every process, alongside whatever else is using
+// the database, so it has to be safe against two things:
+//
+//   - Another Migrate. CREATE TABLE IF NOT EXISTS is not safe against another
+//     session creating the same table at the same moment: one fails with a
+//     duplicate-key error on Postgres's catalog (web and scraper starting
+//     together on an empty database). So callers queue on an advisory lock,
+//     and by the time each gets it the tables exist.
+//
+//   - Ordinary writes. Some statements lock a table even when they turn out
+//     to be no-ops (ALTER TABLE ... ADD COLUMN IF NOT EXISTS takes an
+//     AccessExclusive lock). Inside one transaction those locks pile up, and
+//     Migrate holding one table while waiting for another deadlocks against
+//     an insert whose foreign-key check needs them in the opposite order. So
+//     each statement commits on its own, and Migrate never holds a table lock
+//     while waiting for another.
+//
+// That's why the lock is session-level (pg_advisory_lock on one connection)
+// rather than tied to a transaction.
 func (p *Pool) Migrate(ctx context.Context) error {
-	_, err := p.pool.Exec(ctx, schema)
-	return err
+	conn, err := p.pool.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("acquiring connection for migration: %w", err)
+	}
+	defer conn.Release()
+
+	if _, err := conn.Exec(ctx, "SELECT pg_advisory_lock($1)", migrateLockKey); err != nil {
+		return fmt.Errorf("taking migration lock: %w", err)
+	}
+	defer func() {
+		// A session lock outlives errors and cancelled contexts, so unlock
+		// with a fresh context (with a deadline, so a dead connection can't
+		// hang us). If even that fails, close the connection rather than
+		// return it to the pool still holding the lock: closing is what
+		// releases it, and pgxpool discards closed connections.
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), unlockTimeout)
+		defer cancel()
+		if _, err := conn.Exec(cleanupCtx, "SELECT pg_advisory_unlock($1)", migrateLockKey); err != nil {
+			conn.Conn().Close(cleanupCtx)
+		}
+	}()
+
+	for _, stmt := range schema {
+		if _, err := conn.Exec(ctx, stmt); err != nil {
+			return fmt.Errorf("applying schema: %w\n%s", err, stmt)
+		}
+	}
+	return nil
 }
 
-const schema = `
-CREATE TABLE IF NOT EXISTS service_areas (
+// schema is applied one statement at a time; see Migrate for why.
+var schema = []string{
+	`CREATE TABLE IF NOT EXISTS service_areas (
     id              BIGSERIAL PRIMARY KEY,
     slug            TEXT        NOT NULL UNIQUE,
     name            TEXT        NOT NULL,
@@ -65,9 +122,8 @@ CREATE TABLE IF NOT EXISTS service_areas (
     operator        TEXT,
     mso_rating      REAL        DEFAULT 0,
     last_scraped_at TIMESTAMPTZ
-);
-
--- Facilities are in a separate table for clean querying.
+);`,
+	`-- Facilities are in a separate table for clean querying.
 -- One row per service_area (1:1 relationship but kept separate for clarity).
 CREATE TABLE IF NOT EXISTS facilities (
     service_area_id BIGINT PRIMARY KEY REFERENCES service_areas(id) ON DELETE CASCADE,
@@ -89,17 +145,15 @@ CREATE TABLE IF NOT EXISTS facilities (
     outdoor_space_info  TEXT,
     dog_friendly        BOOLEAN DEFAULT FALSE,
     parking_info        TEXT
-);
-
--- Road memberships: a service at a junction belongs to multiple roads.
+);`,
+	`-- Road memberships: a service at a junction belongs to multiple roads.
 -- The scraper primary-keys on the first road seen; this table captures all.
 CREATE TABLE IF NOT EXISTS service_roads (
     service_area_id BIGINT  REFERENCES service_areas(id) ON DELETE CASCADE,
     road            TEXT    NOT NULL,
     PRIMARY KEY (service_area_id, road)
-);
-
--- Sources table: ready for future enrichment (TripAdvisor, Google etc.)
+);`,
+	`-- Sources table: ready for future enrichment (TripAdvisor, Google etc.)
 CREATE TABLE IF NOT EXISTS service_sources (
     id              BIGSERIAL PRIMARY KEY,
     service_area_id BIGINT      REFERENCES service_areas(id) ON DELETE CASCADE,
@@ -109,26 +163,23 @@ CREATE TABLE IF NOT EXISTS service_sources (
     rating          REAL,
     review_count    INTEGER,
     fetched_at      TIMESTAMPTZ
-);
-
--- Geocoding results, so we hit Nominatim at most once per distinct query.
+);`,
+	`-- Geocoding results, so we hit Nominatim at most once per distinct query.
 -- query is normalised (lower-cased, whitespace collapsed) by the geo package.
 CREATE TABLE IF NOT EXISTS geocode_cache (
     query       TEXT             PRIMARY KEY,
     latitude    DOUBLE PRECISION NOT NULL,
     longitude   DOUBLE PRECISION NOT NULL,
     fetched_at  TIMESTAMPTZ      NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS idx_service_areas_road     ON service_areas(road);
-CREATE INDEX IF NOT EXISTS idx_service_areas_operator ON service_areas(operator);
-CREATE INDEX IF NOT EXISTS idx_service_areas_rating   ON service_areas(mso_rating);
-
-ALTER TABLE service_areas ADD COLUMN IF NOT EXISTS latitude DOUBLE PRECISION;
-ALTER TABLE service_areas ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION;
-CREATE INDEX IF NOT EXISTS idx_service_areas_latlon   ON service_areas(latitude, longitude);
-CREATE INDEX IF NOT EXISTS idx_service_roads_road     ON service_roads(road);
-`
+);`,
+	`CREATE INDEX IF NOT EXISTS idx_service_areas_road     ON service_areas(road);`,
+	`CREATE INDEX IF NOT EXISTS idx_service_areas_operator ON service_areas(operator);`,
+	`CREATE INDEX IF NOT EXISTS idx_service_areas_rating   ON service_areas(mso_rating);`,
+	`ALTER TABLE service_areas ADD COLUMN IF NOT EXISTS latitude DOUBLE PRECISION;`,
+	`ALTER TABLE service_areas ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION;`,
+	`CREATE INDEX IF NOT EXISTS idx_service_areas_latlon   ON service_areas(latitude, longitude);`,
+	`CREATE INDEX IF NOT EXISTS idx_service_roads_road     ON service_roads(road);`,
+}
 
 // UpsertServiceArea inserts or updates a service area and its facilities.
 // We upsert on slug so re-running the scraper updates existing records cleanly.
@@ -219,6 +270,8 @@ func (p *Pool) UpsertServiceArea(ctx context.Context, sa models.ServiceArea) err
 	return tx.Commit(ctx)
 }
 
+// UpdateServiceCoordinates stores geocoded coordinates for the service with
+// the given slug.
 func (p *Pool) UpdateServiceCoordinates(ctx context.Context, slug string, lat, lon float64) error {
 	_, err := p.pool.Exec(ctx, `
 		UPDATE service_areas
@@ -226,6 +279,32 @@ func (p *Pool) UpdateServiceCoordinates(ctx context.Context, slug string, lat, l
 		WHERE slug = $3
 	`, lat, lon, slug)
 	return err
+}
+
+// ListServicesMissingCoordinates returns services with no usable coordinates
+// (never geocoded, or geocoding failed at scrape time), for the backfill
+// command. Only the fields geocoding needs are populated.
+func (p *Pool) ListServicesMissingCoordinates(ctx context.Context) ([]models.ServiceArea, error) {
+	rows, err := p.pool.Query(ctx, `
+		SELECT slug, COALESCE(postcode, ''), COALESCE(address, '')
+		FROM service_areas
+		WHERE latitude IS NULL OR longitude IS NULL OR (latitude = 0 AND longitude = 0)
+		ORDER BY slug
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []models.ServiceArea
+	for rows.Next() {
+		var sa models.ServiceArea
+		if err := rows.Scan(&sa.Slug, &sa.Postcode, &sa.Address); err != nil {
+			return nil, err
+		}
+		out = append(out, sa)
+	}
+	return out, rows.Err()
 }
 
 // GetGeocode returns a cached geocoding result. ok is false on a cache miss.
@@ -308,6 +387,8 @@ func (p *Pool) QueryByRoad(ctx context.Context, road string) ([]models.ServiceAr
 	return out, rows.Err()
 }
 
+// ListServicesOptions are the optional filters for ListServices. Zero values
+// mean "no filter"; Limit defaults to 200 and is capped at 1000.
 type ListServicesOptions struct {
 	Road     string
 	Roads    []string
@@ -317,14 +398,23 @@ type ListServicesOptions struct {
 	Limit    int
 }
 
+// ListServices returns services matching opts, ordered by name. A service
+// with only one of latitude/longitude set is returned with both as 0, the same
+// "no coordinates" marker as a service with neither.
 func (p *Pool) ListServices(ctx context.Context, opts ListServicesOptions) ([]models.ServiceArea, error) {
+	// Nullable text columns are COALESCEd to "" because the scan targets are
+	// plain strings; the scraper never writes NULLs, but hand-maintained rows
+	// can have them.
 	query := `
 		SELECT DISTINCT sa.slug, sa.name, sa.mso_url, sa.road, sa.direction,
-		       sa.location_raw, sa.postcode, sa.address, COALESCE(sa.latitude, 0), COALESCE(sa.longitude, 0), sa.operator, sa.mso_rating,
-		       sa.last_scraped_at::text,
+		       COALESCE(sa.location_raw, ''), COALESCE(sa.postcode, ''), COALESCE(sa.address, ''),
+		       CASE WHEN sa.latitude IS NULL OR sa.longitude IS NULL THEN 0 ELSE sa.latitude END,
+		       CASE WHEN sa.latitude IS NULL OR sa.longitude IS NULL THEN 0 ELSE sa.longitude END, COALESCE(sa.operator, ''), sa.mso_rating,
+		       COALESCE(sa.last_scraped_at::text, ''),
 		       f.catering_brands, f.fuel_brands, f.forecourt_shops, f.hotels,
 		       f.has_showers, f.has_atm, f.has_play_area, f.has_lpg, f.hgv_access,
-		       f.ev_charging, f.ev_charger_info, f.outdoor_space, f.outdoor_space_info,
+		       f.ev_charging, COALESCE(f.ev_charger_info, ''), f.outdoor_space,
+		       COALESCE(f.outdoor_space_info, ''),
 		       f.dog_friendly
 		FROM service_areas sa
 		JOIN facilities f ON f.service_area_id = sa.id

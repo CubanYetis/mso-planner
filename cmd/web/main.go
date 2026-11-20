@@ -8,12 +8,10 @@ import (
 	"fmt"
 	"html/template"
 	"log/slog"
-	"math"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
-	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -22,6 +20,7 @@ import (
 	"github.com/BigRedS/mso-planner/internal/db"
 	"github.com/BigRedS/mso-planner/internal/geo"
 	"github.com/BigRedS/mso-planner/internal/models"
+	"github.com/BigRedS/mso-planner/internal/planner"
 )
 
 const (
@@ -47,33 +46,16 @@ var templates = template.Must(template.New("dashboard").Funcs(template.FuncMap{
 	},
 }).ParseFS(templatesFS, "templates/*.html"))
 
-// roadRefRegexp matches a whole road reference, not a substring: the road
-// number, an optional "(M)" suffix and an optional "Toll". It must stay
-// anchored so that "A1" and "A1(M)", which are different roads, never collapse.
-var roadRefRegexp = regexp.MustCompile(`^([AMN]\d+)\s?(\(M\))?(\s?TOLL)?$`)
+// maxListLimit is the most services ListServices will return; it matches the
+// cap inside db.ListServices.
+const maxListLimit = 1000
 
 type dashboardFilters struct {
 	Road     string
 	Operator string
-	WithFuel bool
-	WithEV   bool
 	Start    string
 	End      string
 	Limit    int
-}
-
-type routePoint = geo.Point
-
-// routeService is a ServiceArea plus where it falls on the planned route,
-// so the template can show stops in journey order. AlongMeters is 0 when no
-// route was planned.
-type routeService struct {
-	models.ServiceArea
-	AlongMeters float64
-}
-
-func (s routeService) AlongKM() float64 {
-	return s.AlongMeters / 1000
 }
 
 type routeData struct {
@@ -83,7 +65,7 @@ type routeData struct {
 	StartLon    float64
 	EndLat      float64
 	EndLon      float64
-	Geometry    []routePoint
+	Geometry    []geo.Point
 	Roads       []string
 	Distance    float64
 	Duration    float64
@@ -96,7 +78,8 @@ type dashboardData struct {
 	WithFuel        int
 	WithEV          int
 	Filters         dashboardFilters
-	Services        []routeService
+	PrefControls    []prefControl
+	Services        []planner.RouteService
 	Error           string
 	Route           routeData
 	RouteGeometryJS template.JS
@@ -206,6 +189,7 @@ func makeHealthzHandler(p pinger) http.HandlerFunc {
 func makeHandler(pool *db.Pool, gc *geo.Geocoder, rt *geo.Router) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		filters := parseFilters(r)
+		prefs := parsePreferences(r.URL.Query())
 		ctx := r.Context()
 
 		total, withFuel, withEV, err := pool.Stats(ctx)
@@ -223,30 +207,25 @@ func makeHandler(pool *db.Pool, gc *geo.Geocoder, rt *geo.Router) http.HandlerFu
 			}
 		}
 
+		// The limit applies to the final results (see selectServices), not to the
+		// candidates: limiting by name in SQL first would spend the slots on
+		// services that the route match or the preferences then drop.
 		listed, err := pool.ListServices(ctx, db.ListServicesOptions{
 			Road:     filters.Road,
 			Roads:    route.Roads,
 			Operator: filters.Operator,
-			WithFuel: filters.WithFuel,
-			WithEV:   filters.WithEV,
-			Limit:    filters.Limit,
+			// planner.Filter below is what decides; this only stops the SQL
+			// LIMIT being spent on services that would be filtered out anyway.
+			WithFuel: prefs.Fuel == planner.Require,
+			WithEV:   prefs.EV == planner.Require,
+			Limit:    maxListLimit,
 		})
 		if err != nil {
 			renderTemplate(w, dashboardData{Error: fmt.Sprintf("could not load services: %v", err)})
 			return
 		}
 
-		services := wrapServices(listed)
-		if len(route.Geometry) > 0 {
-			// With a route planned, only the honest answer will do: if nothing
-			// matches, the table is empty rather than silently reverting to
-			// the unfiltered road list.
-			services, err = filterServicesByRoute(ctx, pool, gc, listed, route)
-			if err != nil {
-				renderTemplate(w, dashboardData{Error: fmt.Sprintf("could not filter services by route: %v", err)})
-				return
-			}
-		}
+		services := selectServices(listed, route.Geometry, prefs, filters.Limit)
 
 		routeJSON := template.JS("null")
 		if len(route.Geometry) > 0 {
@@ -261,6 +240,7 @@ func makeHandler(pool *db.Pool, gc *geo.Geocoder, rt *geo.Router) http.HandlerFu
 			WithFuel:        withFuel,
 			WithEV:          withEV,
 			Filters:         filters,
+			PrefControls:    prefControls(prefs),
 			Services:        services,
 			Route:           route,
 			RouteGeometryJS: routeJSON,
@@ -269,6 +249,7 @@ func makeHandler(pool *db.Pool, gc *geo.Geocoder, rt *geo.Router) http.HandlerFu
 	}
 }
 
+// parseFilters reads the dashboard filters from the query string.
 func parseFilters(r *http.Request) dashboardFilters {
 	query := r.URL.Query()
 	limit := 200
@@ -281,11 +262,48 @@ func parseFilters(r *http.Request) dashboardFilters {
 	return dashboardFilters{
 		Road:     strings.ToUpper(strings.TrimSpace(query.Get("road"))),
 		Operator: strings.TrimSpace(query.Get("operator")),
-		WithFuel: query.Get("fuel") == "on" || query.Get("fuel") == "1",
-		WithEV:   query.Get("ev") == "on" || query.Get("ev") == "1",
 		Start:    strings.TrimSpace(query.Get("start")),
 		End:      strings.TrimSpace(query.Get("end")),
 		Limit:    limit,
+	}
+}
+
+// prefControl is one facility's don't care/prefer/require select on the
+// search form.
+type prefControl struct {
+	Name  string // query parameter, as read by parsePreferences
+	Label string
+	Value planner.Want
+}
+
+func prefControls(p planner.Preferences) []prefControl {
+	return []prefControl{
+		{"fuel", "Fuel", p.Fuel},
+		{"ev", "EV charging", p.EV},
+		{"dog", "Dog walk", p.DogWalk},
+	}
+}
+
+// parsePreferences reads the traveller's preferences from the search form:
+// "prefer" or "require" per facility, anything else meaning don't care.
+// "on" and "1" mean require, so links from when these were checkboxes still
+// work.
+func parsePreferences(query url.Values) planner.Preferences {
+	return planner.Preferences{
+		Fuel:    parseWant(query.Get("fuel")),
+		EV:      parseWant(query.Get("ev")),
+		DogWalk: parseWant(query.Get("dog")),
+	}
+}
+
+func parseWant(v string) planner.Want {
+	switch v {
+	case "prefer":
+		return planner.Prefer
+	case "require", "on", "1":
+		return planner.Require
+	default:
+		return planner.DontCare
 	}
 }
 
@@ -313,232 +331,12 @@ func planRoute(ctx context.Context, gc *geo.Geocoder, rt *geo.Router, start, end
 		EndLat:      endLat,
 		EndLon:      endLon,
 		Geometry:    r.Geometry,
-		Roads:       extractRoadNames(r.Steps),
+		Roads:       planner.ExtractRoadNames(r.Steps),
 		Distance:    r.Distance,
 		Duration:    r.Duration,
 		DistanceKM:  r.Distance / 1000,
 		DurationHrs: r.Duration / 3600,
 	}, nil
-}
-
-// extractRoadNames returns the unique motorway and A-road names in route order.
-// Road numbers live in a step's Ref (possibly several, joined by ";"); Name is
-// only consulted as a fallback because it is usually a street name.
-func extractRoadNames(steps []geo.Step) []string {
-	seen := make(map[string]bool)
-	var roads []string
-
-	for _, step := range steps {
-		candidates := strings.Split(step.Ref, ";")
-		candidates = append(candidates, step.Name)
-		for _, c := range candidates {
-			road := normalizeRoadName(c)
-			if road == "" || seen[road] {
-				continue
-			}
-			seen[road] = true
-			roads = append(roads, road)
-		}
-	}
-
-	return roads
-}
-
-// normalizeRoadName returns the canonical form of a road reference as stored in
-// service_roads.road ("M1", "A1(M)", "M6 Toll"), or "" if name is not exactly
-// a road reference.
-func normalizeRoadName(name string) string {
-	m := roadRefRegexp.FindStringSubmatch(strings.ToUpper(strings.TrimSpace(name)))
-	if m == nil {
-		return ""
-	}
-	road := m[1]
-	if m[2] != "" {
-		road += "(M)"
-	}
-	if m[3] != "" {
-		road += " Toll"
-	}
-	return road
-}
-
-const routeMatchDistanceMeters = 5000
-const earthRadiusMeters = 6371000.0
-
-// filterServicesByRoute fills in missing coordinates, then keeps only the
-// services near the route, in journey order.
-func filterServicesByRoute(ctx context.Context, pool *db.Pool, gc *geo.Geocoder, services []models.ServiceArea, route routeData) ([]routeService, error) {
-	for i := range services {
-		sa := &services[i]
-		if sa.Latitude == 0 && sa.Longitude == 0 && sa.Postcode != "" {
-			if err := maybeGeocodeServiceCoordinates(ctx, pool, gc, sa); err != nil {
-				slog.Warn("could not geocode service", "slug", sa.Slug, "error", err)
-			}
-		}
-	}
-	return servicesNearRoute(services, route.Geometry), nil
-}
-
-// servicesNearRoute returns the services within the matching distance of the
-// route that serve the direction of travel, ordered by how far along the
-// route their closest point falls. Services without coordinates can't be
-// placed and are dropped.
-func servicesNearRoute(services []models.ServiceArea, geometry []routePoint) []routeService {
-	var out []routeService
-	for _, sa := range services {
-		if sa.Latitude == 0 && sa.Longitude == 0 {
-			continue
-		}
-		m, ok := nearestOnRoute(sa.Latitude, sa.Longitude, geometry)
-		if !ok || m.distMeters > routeMatchDistanceMeters {
-			continue
-		}
-		if !directionMatchesBearing(sa.Direction, m.bearing) {
-			continue
-		}
-		out = append(out, routeService{ServiceArea: sa, AlongMeters: m.alongMeters})
-	}
-	sort.SliceStable(out, func(i, j int) bool { return out[i].AlongMeters < out[j].AlongMeters })
-	return out
-}
-
-// directionConeHalfAngleDegrees is how far the route's heading may drift from
-// a service's signed direction before we decide it serves the other
-// carriageway. Motorways bend, so the cones are wide.
-const directionConeHalfAngleDegrees = 45.0
-
-// directionMatchesBearing reports whether a service signed for direction is
-// useful when travelling on the given bearing. "both" (online and junction
-// services) always matches, as do clockwise/anticlockwise: deciding those
-// needs the ring road's centre and there are few of them, so they stay
-// unfiltered for now.
-func directionMatchesBearing(direction string, bearing float64) bool {
-	var want float64
-	switch direction {
-	case "northbound":
-		want = 0
-	case "eastbound":
-		want = 90
-	case "southbound":
-		want = 180
-	case "westbound":
-		want = 270
-	default:
-		return true
-	}
-	diff := math.Abs(math.Mod(bearing-want+540, 360) - 180)
-	return diff <= directionConeHalfAngleDegrees
-}
-
-func wrapServices(services []models.ServiceArea) []routeService {
-	out := make([]routeService, len(services))
-	for i, sa := range services {
-		out[i] = routeService{ServiceArea: sa}
-	}
-	return out
-}
-
-// maybeGeocodeServiceCoordinates fills and persists coordinates for a service.
-func maybeGeocodeServiceCoordinates(ctx context.Context, pool *db.Pool, gc *geo.Geocoder, sa *models.ServiceArea) error {
-	lat, lon, err := gc.Geocode(ctx, sa.Postcode)
-	if err != nil {
-		return err
-	}
-	sa.Latitude = lat
-	sa.Longitude = lon
-	return pool.UpdateServiceCoordinates(ctx, sa.Slug, lat, lon)
-}
-
-// routeMatch describes a point's relationship to a route: how far off the
-// route it is, where along the route its closest point sits, and which way
-// the route heads there.
-type routeMatch struct {
-	distMeters  float64
-	alongMeters float64 // arc length from the route's start to the closest point
-	bearing     float64 // compass heading of the winning segment, degrees
-}
-
-// nearestOnRoute finds the closest point on geometry to (lat, lon). ok is
-// false when the route has no segments to measure against.
-func nearestOnRoute(lat, lon float64, geometry []routePoint) (m routeMatch, ok bool) {
-	if len(geometry) < 2 {
-		return routeMatch{}, false
-	}
-	m.distMeters = math.MaxFloat64
-	var cum float64
-	for i := 0; i < len(geometry)-1; i++ {
-		segLen := haversineMeters(geometry[i].Lat, geometry[i].Lon, geometry[i+1].Lat, geometry[i+1].Lon)
-		d, t := distancePointToSegmentMeters(lat, lon, geometry[i], geometry[i+1])
-		if d < m.distMeters {
-			m.distMeters = d
-			m.alongMeters = cum + t*segLen
-			m.bearing = bearingDegrees(geometry[i], geometry[i+1])
-		}
-		cum += segLen
-	}
-	return m, true
-}
-
-// distancePointToSegmentMeters returns the distance from (lat, lon) to segment
-// a-b and the clamped projection parameter t: 0 means the closest point is a,
-// 1 means b, and values in between are that fraction along the segment.
-func distancePointToSegmentMeters(lat, lon float64, a, b routePoint) (dist float64, t float64) {
-	if a.Lat == b.Lat && a.Lon == b.Lon {
-		return haversineMeters(lat, lon, a.Lat, a.Lon), 0
-	}
-
-	latR := degreesToRadians(lat)
-	lonR := degreesToRadians(lon)
-	aLatR := degreesToRadians(a.Lat)
-	aLonR := degreesToRadians(a.Lon)
-	bLatR := degreesToRadians(b.Lat)
-	bLonR := degreesToRadians(b.Lon)
-	avgLat := (aLatR + bLatR) / 2
-
-	x1 := (aLonR - lonR) * math.Cos(avgLat)
-	y1 := aLatR - latR
-	x2 := (bLonR - lonR) * math.Cos(avgLat)
-	y2 := bLatR - latR
-
-	dx := x2 - x1
-	dy := y2 - y1
-	t = -(x1*dx + y1*dy) / (dx*dx + dy*dy)
-	if t < 0 {
-		return haversineMeters(lat, lon, a.Lat, a.Lon), 0
-	}
-	if t > 1 {
-		return haversineMeters(lat, lon, b.Lat, b.Lon), 1
-	}
-
-	x := x1 + t*dx
-	y := y1 + t*dy
-	return math.Sqrt(x*x+y*y) * earthRadiusMeters, t
-}
-
-// bearingDegrees returns the initial compass bearing from a to b, clockwise
-// from north.
-func bearingDegrees(a, b routePoint) float64 {
-	lat1, lat2 := degreesToRadians(a.Lat), degreesToRadians(b.Lat)
-	dLon := degreesToRadians(b.Lon - a.Lon)
-	y := math.Sin(dLon) * math.Cos(lat2)
-	x := math.Cos(lat1)*math.Sin(lat2) - math.Sin(lat1)*math.Cos(lat2)*math.Cos(dLon)
-	return math.Mod(math.Atan2(y, x)*180/math.Pi+360, 360)
-}
-
-func haversineMeters(lat1, lon1, lat2, lon2 float64) float64 {
-	phi1 := degreesToRadians(lat1)
-	phi2 := degreesToRadians(lat2)
-	deltaPhi := degreesToRadians(lat2 - lat1)
-	deltaLambda := degreesToRadians(lon2 - lon1)
-
-	a := math.Sin(deltaPhi/2)*math.Sin(deltaPhi/2) +
-		math.Cos(phi1)*math.Cos(phi2)*math.Sin(deltaLambda/2)*math.Sin(deltaLambda/2)
-	c := 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
-	return earthRadiusMeters * c
-}
-
-func degreesToRadians(deg float64) float64 {
-	return deg * math.Pi / 180
 }
 
 func renderTemplate(w http.ResponseWriter, data dashboardData) {
@@ -547,4 +345,43 @@ func renderTemplate(w http.ResponseWriter, data dashboardData) {
 		http.Error(w, "template rendering failed", http.StatusInternalServerError)
 		slog.Error("template rendering failed", "error", err)
 	}
+}
+
+// selectServices turns the candidate services into the table's rows, applying
+// limit last so that it can't cut anything the earlier steps would have kept.
+//
+// With a route, only the honest answer will do: if nothing matches, the table
+// is empty rather than silently reverting to the unfiltered road list.
+// Services are matched on coordinates captured at scrape time — none are
+// geocoded here, while a user waits; services without coordinates simply don't
+// appear. The survivors are ranked and the limit keeps the best-ranked, still
+// in journey order. Without a route, the first limit survivors are kept.
+func selectServices(listed []models.ServiceArea, geometry []geo.Point, prefs planner.Preferences, limit int) []planner.RouteService {
+	if len(geometry) == 0 {
+		services := planner.Filter(wrapServices(listed), prefs)
+		if len(services) > limit {
+			services = services[:limit]
+		}
+		return services
+	}
+
+	services := planner.Rank(planner.Filter(planner.ServicesNearRoute(listed, geometry), prefs), prefs)
+	var best []planner.RouteService
+	for _, s := range services {
+		// Ranks are distinct, 1..len, so this keeps exactly limit of them.
+		if s.Rank <= limit {
+			best = append(best, s)
+		}
+	}
+	return best
+}
+
+// wrapServices lists services without route positions, for when no route
+// was planned.
+func wrapServices(services []models.ServiceArea) []planner.RouteService {
+	out := make([]planner.RouteService, len(services))
+	for i, sa := range services {
+		out[i] = planner.RouteService{ServiceArea: sa}
+	}
+	return out
 }

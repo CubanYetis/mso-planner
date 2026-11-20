@@ -1,0 +1,43 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      securityContext:
+        # Distroless images default to root; 65532 is their "nonroot" user.
+        runAsNonRoot: true
+        runAsUser: 65532
+      containers:
+        - name: web
+          image: ghcr.io/cubanyetis/mso-planner-web
+          imagePullPolicy: Always
+          envFrom:
+            # MSO_DB_DSN, MSO_CONTACT - from credentials.env
+            - secretRef:
+                name: mso-planner-secret
+          ports:
+            - containerPort: 8080
+          # No health endpoint yet; listening means migrations ran and the DB
+          # was reachable at startup (main exits otherwise).
+          readinessProbe:
+            tcpSocket:
+              port: 8080
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
