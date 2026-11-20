@@ -113,6 +113,36 @@ Inspect the database with `psql "$MSO_DB_DSN"`. `docker compose down -v` wipes i
 
 ---
 
+## Deploy
+
+Runs on the `farfaraway` k3s cluster from `deploy/k8s` (kustomize): the web
+UI behind Traefik with a cert-manager certificate at
+<https://mso-planner.cubanyetis.net>, and the scraper as a weekly CronJob.
+Images are the `:latest` ones CI pushes to GHCR from main. They must be
+public packages: the cluster has no image pull secret.
+
+```bash
+cp deploy/k8s/credentials.env.example deploy/k8s/credentials.env   # fill in
+kubectl apply -k deploy/k8s
+```
+
+Postgres is outside the cluster, on donkey. It has to accept connections from
+the pod network (k3s: `10.42.0.0/16`), and the database and user must exist
+already. The apps create their own tables.
+
+Day to day:
+
+```bash
+# pick up a new web image (the CronJob pulls a fresh one each run)
+kubectl -n mso-planner rollout restart deployment/web
+# scrape now rather than waiting for Monday
+kubectl -n mso-planner create job scrape-manual-$(date +%s) --from=cronjob/scraper
+# one-off geocode backfill (see cmd/geocode-backfill)
+kubectl -n mso-planner apply -f deploy/k8s/backfill-job.yaml
+```
+
+---
+
 ## What's scraped
 
 From [motorwayservices.uk/Services_List](https://motorwayservices.uk/Services_List):
@@ -139,7 +169,7 @@ come from a Kubernetes Secret and are never committed.
 - [ ] Add PostGIS for spatial queries (currently filtered in Go)
 - [x] Stop geocoding in the web request path (scrape-time + `geocode-backfill` instead)
 - [ ] Use a self-hosted OSRM/Nominatim instead of the public services
-- [ ] Write k8s manifests: web Deployment and scraper CronJob (external Postgres)
+- [x] Write k8s manifests: web Deployment and scraper CronJob (external Postgres)
 - [ ] Add user preference model and scoring
 
 ---

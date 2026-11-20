@@ -1,0 +1,37 @@
+# One-off: geocode services that have no coordinates (see
+# cmd/geocode-backfill). Deliberately not in kustomization.yaml - run by hand
+# when needed, after `kubectl apply -k`:
+#
+#   kubectl -n mso-planner apply -f deploy/k8s/backfill-job.yaml
+#   kubectl -n mso-planner logs -f job/geocode-backfill
+#
+# It's a manifest rather than `kubectl run` because getting envFrom into
+# kubectl run needs an --overrides JSON blob. Finished Jobs are deleted after
+# a day, so re-applying later just works.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: geocode-backfill
+  namespace: mso-planner
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+      containers:
+        - name: geocode-backfill
+          image: ghcr.io/cubanyetis/mso-planner-scraper:latest
+          imagePullPolicy: Always
+          command: ["/geocode-backfill"]
+          envFrom:
+            - secretRef:
+                name: mso-planner-secret
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]

@@ -1,0 +1,38 @@
+# Deploys web + weekly scraper to farfaraway:
+#
+#   cp credentials.env.example credentials.env   # then fill it in
+#   kubectl apply -k deploy/k8s
+#
+# Postgres is external (on donkey, outside the cluster); see the README's
+# Deploy section for what it needs.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: mso-planner
+
+resources:
+  - _namespace.yaml
+  - deployment.yaml
+  - service.yaml
+  - ingress.yaml
+  - cronjob.yaml
+
+# Fixed name (no hash suffix) so backfill-job.yaml, applied by hand, can
+# refer to it. The flip side: changing credentials.env doesn't roll the
+# pods by itself - run `kubectl -n mso-planner rollout restart deployment/web`.
+generatorOptions:
+  disableNameSuffixHash: true
+
+secretGenerator:
+  - name: mso-planner-secret
+    envs:
+      - credentials.env
+
+# `latest` follows main (CI pushes on every merge). The Deployment and
+# CronJob use imagePullPolicy: Always, so the CronJob picks up new builds by
+# itself; the web needs `kubectl -n mso-planner rollout restart deployment/web`.
+images:
+  - name: ghcr.io/cubanyetis/mso-planner-web
+    newTag: latest
+  - name: ghcr.io/cubanyetis/mso-planner-scraper
+    newTag: latest

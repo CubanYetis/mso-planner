@@ -3,8 +3,10 @@ package db
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -218,5 +220,66 @@ func TestMigrateCreatesGeocodeCache(t *testing.T) {
 	}
 	if _, _, _, err := p.GetGeocode(ctx, "after migrate"); err != nil {
 		t.Errorf("GetGeocode after Migrate: %v", err)
+	}
+}
+
+// TestMigrateConcurrent is a regression test: several processes (web and
+// scraper deploying together, or test packages run in parallel) migrating an
+// empty database at once used to fail with "duplicate key value violates
+// unique constraint pg_type_typname_nsp_index", because CREATE TABLE IF NOT
+// EXISTS is not safe against a concurrent create of the same table.
+//
+// The race only happens when the tables don't exist yet, so each run migrates
+// into a fresh, empty schema (via search_path) rather than the shared one.
+func TestMigrateConcurrent(t *testing.T) {
+	dsn := os.Getenv("MSO_TEST_DSN")
+	if dsn == "" {
+		t.Skip("MSO_TEST_DSN not set")
+	}
+	ctx := context.Background()
+	admin := testPool(t)
+	schemaName := fmt.Sprintf("migrate_test_%d", time.Now().UnixNano())
+	if _, err := admin.pool.Exec(ctx, "CREATE SCHEMA "+schemaName); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		admin.pool.Exec(ctx, "DROP SCHEMA "+schemaName+" CASCADE")
+	})
+
+	u, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := u.Query()
+	q.Set("search_path", schemaName)
+	u.RawQuery = q.Encode()
+
+	// One pool per goroutine, standing in for separate processes.
+	const n = 8
+	pools := make([]*Pool, n)
+	for i := range pools {
+		p, err := Connect(ctx, u.String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(p.Close)
+		pools[i] = p
+	}
+
+	var wg sync.WaitGroup
+	errs := make(chan error, n)
+	for _, p := range pools {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- p.Migrate(ctx)
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Errorf("concurrent Migrate: %v", err)
+		}
 	}
 }
