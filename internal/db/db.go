@@ -32,6 +32,7 @@ func Connect(ctx context.Context, dsn string) (*Pool, error) {
 	return &Pool{pool: pool}, nil
 }
 
+// Close releases the connection pool.
 func (p *Pool) Close() {
 	p.pool.Close()
 }
@@ -219,6 +220,8 @@ func (p *Pool) UpsertServiceArea(ctx context.Context, sa models.ServiceArea) err
 	return tx.Commit(ctx)
 }
 
+// UpdateServiceCoordinates stores geocoded coordinates for the service with
+// the given slug.
 func (p *Pool) UpdateServiceCoordinates(ctx context.Context, slug string, lat, lon float64) error {
 	_, err := p.pool.Exec(ctx, `
 		UPDATE service_areas
@@ -226,6 +229,32 @@ func (p *Pool) UpdateServiceCoordinates(ctx context.Context, slug string, lat, l
 		WHERE slug = $3
 	`, lat, lon, slug)
 	return err
+}
+
+// ListServicesMissingCoordinates returns services with no usable coordinates
+// (never geocoded, or geocoding failed at scrape time), for the backfill
+// command. Only the fields geocoding needs are populated.
+func (p *Pool) ListServicesMissingCoordinates(ctx context.Context) ([]models.ServiceArea, error) {
+	rows, err := p.pool.Query(ctx, `
+		SELECT slug, COALESCE(postcode, ''), COALESCE(address, '')
+		FROM service_areas
+		WHERE latitude IS NULL OR longitude IS NULL OR (latitude = 0 AND longitude = 0)
+		ORDER BY slug
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []models.ServiceArea
+	for rows.Next() {
+		var sa models.ServiceArea
+		if err := rows.Scan(&sa.Slug, &sa.Postcode, &sa.Address); err != nil {
+			return nil, err
+		}
+		out = append(out, sa)
+	}
+	return out, rows.Err()
 }
 
 // GetGeocode returns a cached geocoding result. ok is false on a cache miss.
@@ -308,6 +337,8 @@ func (p *Pool) QueryByRoad(ctx context.Context, road string) ([]models.ServiceAr
 	return out, rows.Err()
 }
 
+// ListServicesOptions are the optional filters for ListServices. Zero values
+// mean "no filter"; Limit defaults to 200 and is capped at 1000.
 type ListServicesOptions struct {
 	Road     string
 	Roads    []string
@@ -317,14 +348,23 @@ type ListServicesOptions struct {
 	Limit    int
 }
 
+// ListServices returns services matching opts, ordered by name. A service
+// with only one of latitude/longitude set is returned with both as 0, the same
+// "no coordinates" marker as a service with neither.
 func (p *Pool) ListServices(ctx context.Context, opts ListServicesOptions) ([]models.ServiceArea, error) {
+	// Nullable text columns are COALESCEd to "" because the scan targets are
+	// plain strings; the scraper never writes NULLs, but hand-maintained rows
+	// can have them.
 	query := `
 		SELECT DISTINCT sa.slug, sa.name, sa.mso_url, sa.road, sa.direction,
-		       sa.location_raw, sa.postcode, sa.address, COALESCE(sa.latitude, 0), COALESCE(sa.longitude, 0), sa.operator, sa.mso_rating,
-		       sa.last_scraped_at::text,
+		       COALESCE(sa.location_raw, ''), COALESCE(sa.postcode, ''), COALESCE(sa.address, ''),
+		       CASE WHEN sa.latitude IS NULL OR sa.longitude IS NULL THEN 0 ELSE sa.latitude END,
+		       CASE WHEN sa.latitude IS NULL OR sa.longitude IS NULL THEN 0 ELSE sa.longitude END, COALESCE(sa.operator, ''), sa.mso_rating,
+		       COALESCE(sa.last_scraped_at::text, ''),
 		       f.catering_brands, f.fuel_brands, f.forecourt_shops, f.hotels,
 		       f.has_showers, f.has_atm, f.has_play_area, f.has_lpg, f.hgv_access,
-		       f.ev_charging, f.ev_charger_info, f.outdoor_space, f.outdoor_space_info,
+		       f.ev_charging, COALESCE(f.ev_charger_info, ''), f.outdoor_space,
+		       COALESCE(f.outdoor_space_info, ''),
 		       f.dog_friendly
 		FROM service_areas sa
 		JOIN facilities f ON f.service_area_id = sa.id

@@ -13,8 +13,9 @@ Every services record links back to its MSO page. Please credit MSO if you build
 ```
 mso-planner/
 ├── cmd/
-│   ├── scraper/        # Scraper entrypoint
-│   └── web/            # Route-planner web UI (server-rendered, embedded template)
+│   ├── scraper/          # Scraper entrypoint
+│   ├── geocode-backfill/ # One-off: geocode services that have no coordinates
+│   └── web/              # Route-planner web UI (server-rendered, embedded template)
 ├── internal/
 │   ├── geo/            # Nominatim geocoder (rate-limited, Postgres-cached) and OSRM router
 │   ├── models/         # Shared data types
@@ -84,6 +85,15 @@ docker compose --profile app up web
 
 Open <http://localhost:8080> and enter a start and destination.
 
+The web UI never geocodes services itself: route matching uses the
+coordinates captured at scrape time, and services without coordinates simply
+don't appear in route results. If your database predates scrape-time
+geocoding (or some geocoding failed), run the backfill once:
+
+```bash
+go run ./cmd/geocode-backfill
+```
+
 `/healthz` reports whether the database is reachable (200/503), for a
 container health check. SIGINT/SIGTERM trigger a graceful shutdown: the
 server stops accepting new requests but finishes in-flight ones first.
@@ -125,9 +135,10 @@ come from a Kubernetes Secret and are never committed.
 ## Next steps
 
 - [x] OSRM integration (route geometry → nearby services, basic version)
-- [ ] Tests for the pure parsing/geometry functions
+- [x] Tests for the pure parsing/geometry functions
 - [ ] Add PostGIS for spatial queries (currently filtered in Go)
-- [ ] Stop geocoding in the web request path; use a self-hosted OSRM/Nominatim
+- [x] Stop geocoding in the web request path (scrape-time + `geocode-backfill` instead)
+- [ ] Use a self-hosted OSRM/Nominatim instead of the public services
 - [ ] Write k8s manifests: web Deployment and scraper CronJob (external Postgres)
 - [ ] Add user preference model and scoring
 
