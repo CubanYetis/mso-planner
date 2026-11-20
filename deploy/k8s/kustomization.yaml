@@ -32,7 +32,7 @@ secretGenerator:
 # CronJob use imagePullPolicy: Always, so the CronJob picks up new builds by
 # itself; the web needs `kubectl -n mso-planner rollout restart deployment/web`.
 images:
-  - name: ghcr.io/bigreds/mso-planner-web
+  - name: ghcr.io/cubanyetis/mso-planner-web
     newTag: latest
-  - name: ghcr.io/bigreds/mso-planner-scraper
+  - name: ghcr.io/cubanyetis/mso-planner-scraper
     newTag: latest

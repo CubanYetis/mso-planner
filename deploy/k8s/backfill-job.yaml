@@ -24,7 +24,7 @@ spec:
         runAsUser: 65532
       containers:
         - name: geocode-backfill
-          image: ghcr.io/bigreds/mso-planner-scraper:latest
+          image: ghcr.io/cubanyetis/mso-planner-scraper:latest
           imagePullPolicy: Always
           command: ["/geocode-backfill"]
           envFrom:

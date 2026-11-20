@@ -18,7 +18,7 @@ spec:
         runAsUser: 65532
       containers:
         - name: web
-          image: ghcr.io/bigreds/mso-planner-web
+          image: ghcr.io/cubanyetis/mso-planner-web
           imagePullPolicy: Always
           envFrom:
             # MSO_DB_DSN, MSO_CONTACT - from credentials.env
